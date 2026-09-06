@@ -97,6 +97,26 @@ class MessengerClient {
     constructor() {
         this.baseUrl = window.location.origin;
 
+        // Session-switch serialization — see switchActiveSession()/_applySessionSwitch().
+        this._sessionSwitchRequestId = 0;
+        this._sessionSwitchChain = Promise.resolve();
+
+        // Browser-side TTS (speakViaBrowser) state — see _processTtsQueue()/
+        // _cancelBrowserTts() for details.
+        this._ttsGeneration = 0;
+        this._ttsRetryTimer = null;
+        this._ttsQueue = [];
+        this._ttsPlaying = false;
+        this._ttsWasListening = false;
+
+        // Mic-capture mute has two independent reasons that can both be active
+        // at once — browser TTS (_ttsSpeaking, above) and WS/say-based audio
+        // playback (_wsAudioMuted, set via _muteAudioCapture). The actual
+        // _micMuted gate is the OR of both, kept in sync by _updateMicMuted() —
+        // clearing one reason must never unmute while the other still holds.
+        this._wsAudioMuted = false;
+        this._micMuted = false;
+
         // Conversation elements
         this.conversationMessages = document.getElementById('conversationMessages');
         this.conversationContainer = document.getElementById('conversationContainer');
@@ -152,6 +172,7 @@ class MessengerClient {
         this.sessions = [];
         this.activeSessionKey = null;       // Server's selected key (for backward compat with API responses)
         this.selectedSessionKey = null;     // User's UI selection — authoritative for all routing
+        this._confirmedSessionKey = null;   // Last value the server actually confirmed via POST /api/active-session
         this.unreadCounts = {}; // key → count of messages since last viewed
 
         // Initialize
@@ -195,12 +216,21 @@ class MessengerClient {
                     this.updateVoiceStateUI(data.state);
                 } else if (data.type === 'tts-clear') {
                     this.audioPlayer.clear();
+                    this._cancelBrowserTts();
                 } else if (data.type === 'waitStatus') {
                     this.handleWaitStatus(data.isWaiting);
                 } else if (data.type === 'session-reset') {
                     // New Claude session started — re-sync our voice state with the server
                     console.log('[SSE] New Claude session detected, re-syncing voice state');
                     this.syncVoiceStateToServer();
+                } else if (data.type === 'speak') {
+                    // Non-macOS fallback: the server already renders audio itself via
+                    // `say` on macOS (browserTtsEnabled is false there), so only speak
+                    // here when the server says nothing else will play this text —
+                    // otherwise it plays twice.
+                    if (data.browserTtsEnabled) {
+                        this.speakViaBrowser(data.text);
+                    }
                 }
             } catch (error) {
                 console.error('Failed to parse TTS event:', error);
@@ -212,6 +242,11 @@ class MessengerClient {
             // Reset voice state to prevent stale UI while disconnected
             this.currentVoiceState = 'inactive';
             this.updateVoiceStateUI('inactive');
+            // Browser TTS is driven entirely by SSE `speak`/`tts-clear` events (see
+            // above), which EventSource does not redeliver after a drop — stop any
+            // in-flight/queued browser speech now rather than risk it playing on
+            // regardless of a clear the disconnected client never received.
+            this._cancelBrowserTts();
         };
     }
 
@@ -312,6 +347,7 @@ class MessengerClient {
             const data = await response.json();
             this.sessions = data.sessions || [];
             this.activeSessionKey = data.activeKey;
+            this._confirmedSessionKey = data.activeKey; // this reflects the server's actual state
             // Set initial selection to active key, but never override user's choice
             if (!this.selectedSessionKey) {
                 this.selectedSessionKey = data.activeKey;
@@ -413,10 +449,72 @@ class MessengerClient {
 
     switchActiveSession(key) {
         this.selectedSessionKey = key;
-        // Notify server-side speech recognition which session to target
+        const requestId = ++this._sessionSwitchRequestId;
+        // Update the WS-based recognizer's per-connection target immediately
+        // (not after the POST below), so it never lags behind what the UI shows —
+        // a slow or serialized-behind-other-switches POST would otherwise leave
+        // final transcripts routed to the previous session for longer than the
+        // Sessions panel visually suggests.
         if (this.audioWs && this.audioWs.readyState === WebSocket.OPEN) {
             this.audioWs.send(JSON.stringify({ type: 'select-session', sessionKey: key }));
         }
+        this.renderSessionList();
+        // Chain onto the previous switch so POSTs reach the server in click order
+        // (a fetch only starts once the prior one has settled) — otherwise two
+        // rapid clicks could have their POST responses (and so the server's final
+        // selectedSessionKey) resolve out of order.
+        this._sessionSwitchChain = this._sessionSwitchChain
+            .then(() => this._applySessionSwitch(key, requestId))
+            .catch((error) => console.error('Session switch failed:', error));
+    }
+
+    async _applySessionSwitch(key, requestId) {
+        // Tell the server which session is selected — this is what actually gates
+        // TTS/audio routing (see /api/active-session), and must happen regardless of
+        // whether the WS audio connection below is open (e.g. before the mic has
+        // ever been started, or in browser-recognition mode where it's never opened).
+        let ok = false;
+        try {
+            const response = await fetch(`${this.baseUrl}/api/active-session`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key })
+            });
+            ok = response.ok;
+            if (!ok) {
+                const error = await response.json().catch(() => ({}));
+                console.error('Failed to select session:', error);
+            }
+        } catch (error) {
+            console.error('Failed to select session:', error);
+        }
+
+        // Update the confirmed value regardless of whether a newer switch has
+        // already superseded this one — otherwise, in X→A→B where A succeeds and
+        // B later fails, B's rollback would use the stale X instead of A (the
+        // server's actual current selection after A's POST completed).
+        if (ok) {
+            this._confirmedSessionKey = key;
+        }
+
+        if (requestId !== this._sessionSwitchRequestId) return; // superseded; a newer switch owns the UI now
+
+        if (!ok) {
+            // Roll back the optimistic UI selection so it doesn't diverge from
+            // what the server actually has selected (resolveSessionForNewInput()
+            // on the server still uses the last confirmed key, not this one).
+            // _confirmedSessionKey can legitimately be null (no switch has ever
+            // succeeded yet) — send it to WS as-is rather than skipping on falsy,
+            // so the WS-side per-connection target actually clears too.
+            this.selectedSessionKey = this._confirmedSessionKey;
+            this.renderSessionList();
+            if (this.audioWs && this.audioWs.readyState === WebSocket.OPEN) {
+                this.audioWs.send(JSON.stringify({ type: 'select-session', sessionKey: this._confirmedSessionKey }));
+            }
+            alert('セッションの切り替えに失敗しました。もう一度お試しください。');
+            return;
+        }
+
         // Clear unread for this session
         delete this.unreadCounts[key];
         // Clear existing messages so the new session's messages replace them
@@ -751,6 +849,10 @@ class MessengerClient {
         await this.sendMessage(text);
     }
 
+    // Returns true on success, false otherwise — callers use this to decide
+    // whether it's safe to clear their own copy of the text (see
+    // stopVoiceDictation(), which used to unconditionally clear the input
+    // box right after calling this, wiping out the 409 restore below).
     async sendMessage(text) {
         try {
             const response = await fetch(`${this.baseUrl}/api/potential-utterances`, {
@@ -761,9 +863,22 @@ class MessengerClient {
 
             if (response.ok) {
                 this.loadData();
+                return true;
+            } else if (response.status === 409) {
+                // Multiple sessions exist and none is selected — the server
+                // refuses to guess which one this belongs to (see resolveSessionForInput
+                // on the server). Restore the text so it isn't silently lost.
+                this.messageInput.value = text;
+                alert('複数のセッションが起動中です。左のSessionsパネルから対象のセッションを選択してから送信してください。');
+                return false;
+            } else {
+                const error = await response.json().catch(() => ({}));
+                console.error('Failed to send message:', error);
+                return false;
             }
         } catch (error) {
             console.error('Failed to send message:', error);
+            return false;
         }
     }
 
@@ -815,8 +930,10 @@ class MessengerClient {
         // Send any accumulated text in the input (from browser recognition)
         const text = this.messageInput.value.trim();
         if (text && !this.isInterimText) {
-            await this.sendMessage(text);
-            this.messageInput.value = '';
+            const sent = await this.sendMessage(text);
+            if (sent) this.messageInput.value = '';
+            // On failure, sendMessage already restored/left the text in place
+            // (e.g. the 409 "select a session" case) — don't wipe it out here.
         }
 
         this.isInterimText = false;
@@ -841,11 +958,13 @@ class MessengerClient {
         this.recognition = new SpeechRecognition();
         this.recognition.continuous = true;
         this.recognition.interimResults = true;
-        this.recognition.lang = 'en-US';
+        this.recognition.lang = 'ja-JP';
 
         this.recognition.onresult = (event) => {
             // Skip browser recognition results when using server recognition
             if (this.useServerRecognition) return;
+            // Skip results while Claude is speaking, to avoid picking up speaker echo
+            if (this._ttsSpeaking) return;
 
             let interimTranscript = '';
 
@@ -877,8 +996,8 @@ class MessengerClient {
         };
 
         this.recognition.onend = () => {
-            // Only restart browser recognition if listening and not using server
-            if (this.isListening && !this.useServerRecognition) {
+            // Only restart browser recognition if listening, not using server, and Claude isn't speaking
+            if (this.isListening && !this.useServerRecognition && !this._ttsSpeaking) {
                 try {
                     this.recognition.start();
                 } catch (e) {
@@ -911,6 +1030,147 @@ class MessengerClient {
         } catch (error) {
             console.error('Failed to delete message:', error);
         }
+    }
+
+    _cancelBrowserTts() {
+        // Mirrors the server's TTS queue clear (tts-clear) for the browser
+        // SpeechSynthesis fallback path, which the server has no visibility into
+        // and therefore can't stop on its own.
+        if (!window.speechSynthesis) return;
+        if (this._ttsRetryTimer) {
+            clearTimeout(this._ttsRetryTimer);
+            this._ttsRetryTimer = null;
+        }
+        this._ttsQueue = [];
+        this._ttsGeneration++; // invalidate any in-flight/queued utterance's callbacks
+        window.speechSynthesis.cancel();
+        this._ttsPlaying = false;
+        if (!this._ttsSpeaking) return; // browser TTS wasn't actually muting anything right now
+        this._ttsSpeaking = false;
+        this._updateMicMuted(); // still respects _wsAudioMuted if that's separately active
+        if (this.isListening) {
+            if (this.micBtn) this.micBtn.classList.add('listening');
+            if (!this.useServerRecognition && this.recognition) {
+                try { this.recognition.start(); } catch (e) {}
+            }
+        }
+    }
+
+    // Queues text for browser TTS instead of interrupting whatever is currently
+    // speaking — SpeechSynthesis.speak() would naturally queue back-to-back calls
+    // on its own, but earlier code called cancel() before every utterance (to keep
+    // stale retries/utterances from firing), which also cut off in-progress speech
+    // whenever two `speak` events arrived close together. This queue keeps that
+    // cancel() scoped to explicit clears (_cancelBrowserTts) only.
+    speakViaBrowser(text) {
+        if (!window.speechSynthesis || !text) return;
+        this._ttsQueue.push({ text, generation: this._ttsGeneration });
+        this._processTtsQueue();
+    }
+
+    _processTtsQueue(retryCount = 0) {
+        if (this._ttsPlaying) return; // an utterance is already in flight; its onend/onerror re-enters this
+
+        const item = this._ttsQueue[0];
+        if (!item) return; // nothing queued
+
+        if (item.generation !== this._ttsGeneration) {
+            // Cleared (tts-clear) since this was queued — drop it and check the next one.
+            this._ttsQueue.shift();
+            this._processTtsQueue();
+            return;
+        }
+
+        // Voice list can still be empty on the very first call even after the
+        // DOMContentLoaded warmup; retry briefly rather than silently falling
+        // back to whatever default voice the browser picks. Capped so a browser
+        // that never installs a Japanese voice doesn't retry forever — it speaks
+        // with the default voice instead of staying silent. _voiceWaitExhausted
+        // remembers that this cap was already hit once, so a browser with no
+        // Japanese voice at all doesn't re-pay the ~3s wait for every queued
+        // item — retryCount alone resets to 0 per item and can't track this
+        // across calls (reset if the voice list changes; see DOMContentLoaded).
+        const MAX_VOICE_WAIT_RETRIES = 20; // ~3s at 150ms
+        const voicesNow = window.speechSynthesis.getVoices();
+        const hasJaVoice = voicesNow.some((v) => v.lang && v.lang.startsWith('ja'));
+        if (!hasJaVoice && !this._voiceWaitExhausted && retryCount < MAX_VOICE_WAIT_RETRIES) {
+            // A retry is already scheduled (e.g. from an earlier, still-queued item) —
+            // don't stack a second timer on top of it; it will re-check the queue head.
+            if (!this._ttsRetryTimer) {
+                this._ttsRetryTimer = setTimeout(() => {
+                    this._ttsRetryTimer = null;
+                    this._processTtsQueue(retryCount + 1);
+                }, 150);
+            }
+            return;
+        }
+        if (!hasJaVoice) {
+            this._voiceWaitExhausted = true;
+        }
+        this._ttsRetryTimer = null;
+
+        this._ttsQueue.shift();
+        this._ttsPlaying = true;
+        const generation = item.generation;
+
+        if (!this._ttsSpeaking) {
+            // First utterance of this speaking burst — mute the mic once for the
+            // whole queue, not per-utterance, so back-to-back speech doesn't
+            // flicker the mic on/off between items.
+            this._ttsWasListening = this.isListening;
+            this._ttsSpeaking = true;
+            this._updateMicMuted();
+            if (this.micBtn) this.micBtn.classList.remove('listening');
+            if (this.recognition) {
+                try { this.recognition.stop(); } catch (e) {}
+            }
+        }
+
+        const utterance = new SpeechSynthesisUtterance(item.text);
+        utterance.lang = 'ja-JP';
+        // this.speechRate is already a "1.0 = normal" multiplier (see the
+        // speech rate slider and its use for the say-based rate above), which
+        // is the same scale SpeechSynthesisUtterance.rate expects — this was
+        // previously hardcoded to 1.15 and silently ignored the UI's setting
+        // on any platform where browser TTS is the only playback path.
+        utterance.rate = Math.min(10, Math.max(0.1, this.speechRate || 1.0));
+        utterance.pitch = 1.0;
+        const voices = window.speechSynthesis.getVoices();
+        const jaVoices = voices.filter((v) => v.lang && v.lang.startsWith('ja'));
+        const priorityNames = ['Google 日本語', 'Haruka', 'Nanami', 'Ayumi'];
+        let preferred = null;
+        for (const name of priorityNames) {
+            preferred = jaVoices.find((v) => v.name.includes(name));
+            if (preferred) break;
+        }
+        if (!preferred) preferred = jaVoices[0];
+        if (preferred) utterance.voice = preferred;
+
+        const advance = () => {
+            // Check generation BEFORE touching _ttsPlaying: cancel() delivers this
+            // utterance's onend/onerror asynchronously, so a stale callback can still
+            // arrive after a newer utterance has already started (and is genuinely
+            // in flight). Mutating _ttsPlaying unconditionally would let a second
+            // queue item start on top of that still-playing newer utterance.
+            if (generation !== this._ttsGeneration) return; // superseded; _cancelBrowserTts already reset state
+            this._ttsPlaying = false;
+            if (this._ttsQueue.length === 0 || this._ttsQueue[0].generation !== this._ttsGeneration) {
+                // Nothing left to speak in this generation — resume the mic
+                this._ttsSpeaking = false;
+                this._updateMicMuted();
+                if (this._ttsWasListening && this.isListening) {
+                    if (this.micBtn) this.micBtn.classList.add('listening');
+                    if (!this.useServerRecognition && this.recognition) {
+                        try { this.recognition.start(); } catch (e) {}
+                    }
+                }
+            }
+            this._processTtsQueue();
+        };
+        utterance.onend = advance;
+        utterance.onerror = advance;
+
+        window.speechSynthesis.speak(utterance);
     }
 
     async updateVoiceActive(active) {
@@ -1017,9 +1277,11 @@ class MessengerClient {
             console.log('[WS] Disconnected');
             this.wsConnected = false;
             this.audioWs = null;
-            // Reset TTS playback state and unmute mic on disconnect
+            // Reset TTS playback state and clear the WS-side mute reason on
+            // disconnect (still respects browser TTS's own mute, if active).
             this.audioPlayer.clear();
-            this._micMuted = false;
+            this._wsAudioMuted = false;
+            this._updateMicMuted();
             // Reconnect if still listening
             if (this.isListening) {
                 this.scheduleWsReconnect();
@@ -1073,6 +1335,12 @@ class MessengerClient {
                 break;
             }
             case 'tts-clear':
+                // Browser TTS (SpeechSynthesis) is driven entirely by the SSE `speak`
+                // event, so it's cleared there (see the SSE tts-clear handler above).
+                // The server broadcasts tts-clear on both SSE and this WS channel for
+                // the same event; calling _cancelBrowserTts() from both risks a
+                // duplicate/out-of-order clear cancelling a legitimate new utterance
+                // that started in the gap between the two deliveries.
                 this.debugLog('[WS] TTS clear');
                 this.audioPlayer.clear();
                 this._muteAudioCapture(false);
@@ -1082,15 +1350,34 @@ class MessengerClient {
                 break;
             case 'error':
                 console.error('[WS] Server error:', msg.message);
+                if (msg.code === 'no_session_selected' && msg.text) {
+                    // The server dropped this speech instead of guessing which
+                    // session it belongs to (see resolveSessionForNewInput on the
+                    // server) — restore it into the input box so it isn't silently
+                    // lost, matching sendMessage()'s 409 handling for typed text.
+                    this.messageInput.value = msg.text;
+                    this.isInterimText = false;
+                    this.autoGrowTextarea();
+                    alert('複数のセッションが起動中です。左のSessionsパネルから対象のセッションを選択してから送信してください。');
+                }
                 break;
             default:
                 this.debugLog('[WS] Unknown message type:', msg.type);
         }
     }
 
-    // Echo suppression: mute/unmute mic audio streaming
+    // Recomputes the actual mic-capture gate from both independent mute
+    // reasons — see the constructor comment on _wsAudioMuted/_ttsSpeaking.
+    _updateMicMuted() {
+        this._micMuted = this._wsAudioMuted || this._ttsSpeaking;
+    }
+
+    // Echo suppression: mute/unmute mic audio streaming for the WS/say-based
+    // playback path specifically. Does not by itself unmute if browser TTS
+    // (_ttsSpeaking) is still separately holding the mute.
     _muteAudioCapture(mute) {
-        this._micMuted = mute;
+        this._wsAudioMuted = mute;
+        this._updateMicMuted();
     }
 
     _waitForPlaybackThenAck(audioId) {
@@ -1217,5 +1504,11 @@ class MessengerClient {
 
 // Initialize when page loads
 document.addEventListener('DOMContentLoaded', () => {
+    // Warm up the speech synthesis voice list early, since getVoices() can
+    // return an empty array on the very first call in some browsers.
+    if (window.speechSynthesis) {
+        window.speechSynthesis.getVoices();
+        window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+    }
     new MessengerClient();
 });

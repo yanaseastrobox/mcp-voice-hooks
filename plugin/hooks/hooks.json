@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/stop\" -H 'Content-Type: application/json' -d \"$INPUT\" || echo '{}'"
+            "command": "curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/stop\" -H 'Content-Type: application/json; charset=utf-8' --data-binary @- || echo '{}'"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/pre-speak\" -H 'Content-Type: application/json' -d \"$INPUT\" || echo '{}'"
+            "command": "curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/pre-speak\" -H 'Content-Type: application/json; charset=utf-8' --data-binary @- || echo '{}'"
           }
         ]
       }
@@ -28,7 +28,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/post-tool\" -H 'Content-Type: application/json' -d \"$INPUT\" || echo '{}'"
+            "command": "curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/post-tool\" -H 'Content-Type: application/json; charset=utf-8' --data-binary @- || echo '{}'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -X POST \"http://localhost:${MCP_VOICE_HOOKS_PORT:-5111}/api/hooks/user-prompt\" -H 'Content-Type: application/json; charset=utf-8' --data-binary @- || echo '{}'"
           }
         ]
       }

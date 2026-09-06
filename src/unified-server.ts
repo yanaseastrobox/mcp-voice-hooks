@@ -27,7 +27,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Constants
-const WAIT_TIMEOUT_SECONDS = 300; // 5-minute safety net; primary exit is browser disconnect
+const WAIT_TIMEOUT_SECONDS = 1800; // 30-minute safety net; primary exit is browser disconnect
 const HTTP_PORT = process.env.MCP_VOICE_HOOKS_PORT ? parseInt(process.env.MCP_VOICE_HOOKS_PORT) : 5111;
 const HTTPS_PORT = process.env.MCP_VOICE_HOOKS_HTTPS_PORT ? parseInt(process.env.MCP_VOICE_HOOKS_HTTPS_PORT) : HTTP_PORT + 1;
 
@@ -238,6 +238,12 @@ class UtteranceQueue {
 
 // Determine if we're running in MCP-managed mode
 const IS_MCP_MANAGED = process.argv.includes('--mcp-managed');
+// `say`-based rendering (renderTtsToFile) only exists on macOS — it fails on both
+// Windows and Linux, not just Windows. The browser's own SpeechSynthesis (triggered
+// by the `speak` SSE event's browserTtsEnabled flag, see notifyTTSClients) is the
+// fallback everywhere else, and the two playback paths must stay mutually
+// exclusive per-platform or the same text plays twice.
+const IS_MACOS = process.platform === 'darwin';
 const NO_TRANSCRIBE = process.argv.includes('--no-transcribe') || process.env.MCP_VOICE_HOOKS_NO_TRANSCRIBE === 'true';
 const SPEECH_RECOGNIZER_AVAILABLE = !NO_TRANSCRIBE && SpeechRecognizer.binaryExists(path.join(__dirname, '..'));
 
@@ -542,7 +548,7 @@ const sessions = new Map<string, SessionState>();
 // then updated by browser's 'select-session' WS message.
 let selectedSessionKey: string | null = null;
 
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minute TTL
+const SESSION_TTL_MS = 120 * 60 * 1000; // 2 hour TTL (kept longer than WAIT_TIMEOUT_SECONDS so a session can't expire mid-wait)
 
 function getOrCreateSession(key: string, sessionId?: string, agentId?: string | null, agentType?: string | null): SessionState {
   let session = sessions.get(key);
@@ -599,6 +605,62 @@ function getActiveSessionOrFirst(): SessionState {
   return getOrCreateSession(defaultKey);
 }
 
+// Number of sessions that count toward "is there ambiguity about who this
+// input/speech belongs to". Excludes the anonymous 'default' session, which
+// read-only endpoints (getActiveSessionOrFirst) create as a side effect
+// whenever they're hit before any real Claude Code session has registered
+// (e.g. the browser's own idle polling, opened before Claude Code starts).
+// Without this exclusion, that placeholder session alone would make
+// sessions.size 2 the moment one real session appears, wrongly treating the
+// single-real-session case as ambiguous (409-rejecting input, suppressing TTS).
+function countRealSessions(): number {
+  let count = 0;
+  for (const session of sessions.values()) {
+    if (session.sessionId !== 'default') count++;
+  }
+  return count;
+}
+
+// The one non-default session, when countRealSessions() === 1. Needed because
+// Map iteration order is insertion order, and the placeholder 'default'
+// session (see countRealSessions) is typically created before any real
+// session registers — so sessions.values().next().value would return the
+// empty default session instead of the real one.
+function getSingleRealSession(): SessionState | undefined {
+  for (const session of sessions.values()) {
+    if (session.sessionId !== 'default') return session;
+  }
+  return undefined;
+}
+
+// Resolves the session NEW input (a typed/spoken utterance) should be attributed
+// to. Unlike getActiveSessionOrFirst() — which is fine for read-only endpoints
+// showing "whatever session's" data — this refuses to guess when nothing is
+// explicitly selected and more than one session exists: silently attaching new
+// input to an arbitrary session (e.g. an unrelated background task) is the same
+// class of hijack the disabled autoSelectIfNone and the /api/speak audio-routing
+// checks above guard against, just on the input side.
+function resolveSessionForNewInput(explicitKey: string | undefined | null): SessionState | null {
+  if (explicitKey && sessions.has(explicitKey)) {
+    return sessions.get(explicitKey)!;
+  }
+  if (selectedSessionKey && sessions.has(selectedSessionKey)) {
+    return sessions.get(selectedSessionKey)!;
+  }
+  const realCount = countRealSessions();
+  if (realCount === 1) {
+    // No ambiguity — single-session backward compat. Deliberately NOT
+    // getActiveSessionOrFirst(): with a placeholder 'default' session also
+    // present (inserted first, see countRealSessions), that would return the
+    // empty default instead of the one real session.
+    return getSingleRealSession()!;
+  }
+  if (realCount === 0) {
+    return getActiveSessionOrFirst(); // truly nothing yet — use/create the default session
+  }
+  return null; // ambiguous; caller must reject rather than guess
+}
+
 // Session TTL cleanup
 function cleanupSessions(): void {
   const now = Date.now();
@@ -615,48 +677,115 @@ function cleanupSessions(): void {
 // Run session cleanup every 5 minutes
 setInterval(cleanupSessions, 5 * 60 * 1000);
 
-// Pre-speak text whitelist: text → { count, expiry }
+// Pre-speak text whitelist: text → FIFO queue of { sessionKey, expiry }.
 // Global because MCP speak calls arrive without session identity.
-// The pre-speak hook (which has identity) bridges this gap.
-const speakWhitelist = new Map<string, { count: number; expiry: number; sessionKey: string }>();
+// The pre-speak hook (which has identity) bridges this gap. A queue (rather
+// than a single overwritable entry) is required because two sessions can
+// legitimately speak the exact same text around the same time — with a single
+// entry, the second registration silently overwrites the first session's
+// identity, misattributing the first session's eventual /api/speak call to
+// the second session instead.
+const speakWhitelist = new Map<string, Array<{ sessionKey: string; expiry: number }>>();
 
 const WHITELIST_TTL_MS = 5000; // 5 second TTL for whitelist entries
 
 function addToWhitelist(text: string, sessionKey: string): void {
-  const existing = speakWhitelist.get(text);
   const expiry = Date.now() + WHITELIST_TTL_MS;
-  if (existing) {
-    existing.count++;
-    existing.expiry = expiry;
-    existing.sessionKey = sessionKey; // Update to latest session
-  } else {
-    speakWhitelist.set(text, { count: 1, expiry, sessionKey });
-  }
-  debugLog(`[Whitelist] Added: key=${sessionKey} text="${text.slice(0, 30)}..." count=${speakWhitelist.get(text)!.count}`);
+  const queue = speakWhitelist.get(text) || [];
+  queue.push({ sessionKey, expiry });
+  speakWhitelist.set(text, queue);
+  debugLog(`[Whitelist] Added: key=${sessionKey} text="${text.slice(0, 30)}..." queueLength=${queue.length}`);
 }
 
+// FIFO: matches and removes the oldest still-valid entry for this text.
 function checkWhitelist(text: string): { matched: boolean; sessionKey?: string } {
   cleanupWhitelist();
-  const entry = speakWhitelist.get(text);
-  if (entry && entry.count > 0) {
-    const sessionKey = entry.sessionKey;
-    entry.count--;
-    if (entry.count === 0) {
-      speakWhitelist.delete(text);
+  const queue = speakWhitelist.get(text);
+  if (queue && queue.length > 0) {
+    // If two or more DIFFERENT sessions registered this exact text, FIFO order
+    // here isn't trustworthy: the pre-speak hook (registration) and the actual
+    // MCP tool call (this lookup) are separate round-trips per session, and
+    // their relative arrival order across independent sessions isn't
+    // guaranteed. Guessing (even "oldest first") risks misattributing one
+    // session's speech to another, which is worse than not matching at all —
+    // so leave the queue intact and report unmatched instead.
+    const distinctSessions = new Set(queue.map(e => e.sessionKey));
+    if (distinctSessions.size > 1) {
+      debugLog(`[Speak] Whitelist ambiguous (${distinctSessions.size} sessions queued for same text): text="${text.slice(0, 30)}..."`);
+      return { matched: false };
     }
-    debugLog(`[Speak] Whitelist match: text="${text.slice(0, 30)}..." sessionKey=${sessionKey} remaining=${entry.count}`);
-    return { matched: true, sessionKey };
+    const entry = queue.shift()!;
+    if (queue.length === 0) speakWhitelist.delete(text);
+    debugLog(`[Speak] Whitelist match: text="${text.slice(0, 30)}..." sessionKey=${entry.sessionKey} remaining=${queue.length}`);
+    return { matched: true, sessionKey: entry.sessionKey };
   }
   debugLog(`[Speak] Whitelist miss: text="${text.slice(0, 30)}..."`);
   return { matched: false };
 }
 
+// Removes the entry for a SPECIFIC session, used when the calling session was
+// already identified via the speak-token path (see issueSpeakToken) — the
+// pre-speak hook always adds a whitelist entry alongside issuing the token, so
+// it must be consumed by session identity here, not just FIFO-popped, or a
+// later unrelated call for the same text could still (mis)match against it.
+function consumeWhitelistEntryForSession(text: string, sessionKey: string): void {
+  cleanupWhitelist();
+  const queue = speakWhitelist.get(text);
+  if (!queue) return;
+  const idx = queue.findIndex(e => e.sessionKey === sessionKey);
+  if (idx === -1) return;
+  queue.splice(idx, 1);
+  if (queue.length === 0) speakWhitelist.delete(text);
+}
+
 function cleanupWhitelist(): void {
   const now = Date.now();
-  for (const [text, entry] of speakWhitelist) {
-    if (entry.expiry < now) {
+  for (const [text, queue] of speakWhitelist) {
+    const filtered = queue.filter(e => e.expiry >= now);
+    if (filtered.length === 0) {
       speakWhitelist.delete(text);
       debugLog(`[Whitelist] Expired "${text.substring(0, 50)}..."`);
+    } else if (filtered.length !== queue.length) {
+      speakWhitelist.set(text, filtered);
+    }
+  }
+}
+
+// Speak tokens: a single-use, opaque, session-identity-carrying alternative to
+// the text-keyed whitelist above. The pre-speak hook issues one per PreToolUse
+// invocation of `speak` and injects it into the tool's own arguments via
+// hookSpecificOutput.updatedInput, so /api/speak can identify the calling
+// session directly instead of matching on the spoken text (which collides if
+// two sessions say the exact same thing around the same time). Kept alongside
+// the text whitelist as a fallback, in case updatedInput injection doesn't
+// apply for a given Claude Code / MCP client combination.
+const speakTokens = new Map<string, { sessionKey: string; expiry: number }>();
+const SPEAK_TOKEN_TTL_MS = 30000; // 30s — consumed almost immediately in the same tool-call round-trip
+
+function issueSpeakToken(sessionKey: string): string {
+  cleanupSpeakTokens();
+  const token = randomUUID();
+  speakTokens.set(token, { sessionKey, expiry: Date.now() + SPEAK_TOKEN_TTL_MS });
+  return token;
+}
+
+// Single-use: returns the session key and deletes the token, or null if unknown/expired.
+function consumeSpeakToken(token: string): string | null {
+  const entry = speakTokens.get(token);
+  if (!entry) return null;
+  speakTokens.delete(token);
+  if (entry.expiry < Date.now()) {
+    debugLog(`[SpeakToken] Expired token consumed, ignoring`);
+    return null;
+  }
+  return entry.sessionKey;
+}
+
+function cleanupSpeakTokens(): void {
+  const now = Date.now();
+  for (const [token, entry] of speakTokens) {
+    if (entry.expiry < now) {
+      speakTokens.delete(token);
     }
   }
 }
@@ -683,7 +812,15 @@ app.post('/api/potential-utterances', (req: Request, res: Response) => {
     return;
   }
 
-  const session = getSessionFromRequest(req);
+  const explicitKey = (req.query?.session as string) || (req.body?.session as string);
+  const session = resolveSessionForNewInput(explicitKey);
+  if (!session) {
+    res.status(409).json({
+      error: 'Multiple sessions exist and none is selected',
+      message: 'Select a session in the Sessions panel before sending input'
+    });
+    return;
+  }
   const parsedTimestamp = timestamp ? new Date(timestamp) : undefined;
   const utterance = session.queue.add(text, parsedTimestamp);
   res.json({
@@ -792,18 +929,47 @@ async function waitForUtteranceCore(session?: SessionState) {
   // Notify frontend that wait has started
   notifyWaitStatus(true);
 
+  // Voice input toggling off is treated as a soft signal, not an instant abort:
+  // a brief mic drop (flaky mic, accidental toggle) shouldn't end a 30-minute wait.
+  const MIC_OFF_GRACE_MS = 180 * 1000;
+  let micOffSince: number | null = null;
+
   // Poll for utterances
   while (Date.now() - startTime < maxWaitMs) {
     // Check if voice input is still active
     if (!voicePreferences.voiceActive) {
-      debugLog('[WaitCore] Voice input deactivated during wait_for_utterance');
-      notifyWaitStatus(false); // Notify wait has ended
-      return {
-        success: true,
-        utterances: [],
-        message: 'Voice input was deactivated',
-        waitTime: Date.now() - startTime,
-      };
+      // No browser/audio client connected at all (vs. one connected with the mic
+      // just toggled off) — the grace period exists for the latter case only.
+      // Exiting immediately here keeps "browser disconnect" as the primary,
+      // near-instant exit path documented on WAIT_TIMEOUT_SECONDS above; without
+      // this, closing the browser would leave the wait (and the calling tool
+      // call/turn) hanging for up to MIC_OFF_GRACE_MS.
+      const noClientsConnected = ttsClients.size === 0 && wsAudioClients.size === 0;
+      if (noClientsConnected) {
+        debugLog('[WaitCore] All clients disconnected, ending wait_for_utterance');
+        notifyWaitStatus(false); // Notify wait has ended
+        return {
+          success: true,
+          utterances: [],
+          message: 'Voice input was deactivated',
+          waitTime: Date.now() - startTime,
+        };
+      }
+      if (micOffSince === null) {
+        micOffSince = Date.now();
+        debugLog('[WaitCore] Voice input deactivated, entering grace period');
+      } else if (Date.now() - micOffSince > MIC_OFF_GRACE_MS) {
+        debugLog('[WaitCore] Grace period expired, ending wait_for_utterance');
+        notifyWaitStatus(false); // Notify wait has ended
+        return {
+          success: true,
+          utterances: [],
+          message: 'Voice input was deactivated',
+          waitTime: Date.now() - startTime,
+        };
+      }
+    } else {
+      micOffSince = null;
     }
 
     const pendingUtterances = s.queue.utterances.filter(
@@ -1071,27 +1237,11 @@ function isSelectedKey(key: string): boolean {
 // This handles voice input arriving before the browser connects.
 // Once the browser connects, it takes over via 'select-session' WS message.
 function autoSelectIfNone(key: string): void {
-  if (selectedSessionKey === null) {
-    selectedSessionKey = key;
-    debugLog(`[Session] Auto-selected (first session): ${key}`);
-
-    // Check if there's a default session with data that should be migrated
-    const parsed = JSON.parse(key) as [string, string];
-    const newSessionId = parsed[0];
-    if (newSessionId !== 'default') {
-      migrateDefaultSession(key, newSessionId);
-    }
-  } else if (selectedSessionKey) {
-    // If current selection is a default session and this is a real session, upgrade
-    const currentSelected = sessions.get(selectedSessionKey);
-    const parsed = JSON.parse(key) as [string, string];
-    const newSessionId = parsed[0];
-    if (currentSelected && currentSelected.sessionId === 'default' && newSessionId !== 'default') {
-      migrateDefaultSession(key, newSessionId);
-      selectedSessionKey = key;
-      debugLog(`[Session] Auto-selected (upgraded from default): ${key}`);
-    }
-  }
+  // Disabled (2026-09-06): auto-selecting "the first session that shows up" hijacked
+  // the voice destination whenever an unrelated background session (e.g. a scheduled
+  // task) touched a hook first. Session selection is manual-only now, via the
+  // browser's Sessions panel / POST /api/active-session.
+  return;
 }
 
 // Migrate utterances and messages from the default session to a new session
@@ -1172,9 +1322,20 @@ app.post('/api/hooks/pre-speak', (req: Request, res: Response) => {
   const speakText = toolInput?.text;
 
   const result = handleHookRequest('speak', session);
-  // If approved and we have text, always whitelist (regardless of selected session)
+  // If approved and we have text, always whitelist (regardless of selected session).
+  // Also issue a single-use token identifying this exact call's session, injected
+  // into the tool's own arguments via updatedInput — see speakTokens above for why.
   if (speakText && (result as any).decision !== 'block') {
     addToWhitelist(speakText, key);
+    const voiceToken = issueSpeakToken(key);
+    (result as any).hookSpecificOutput = {
+      hookEventName: 'PreToolUse',
+      // Every documented example pairing updatedInput with a decision includes
+      // permissionDecision explicitly — Claude Code's behavior when it's omitted
+      // isn't documented, so set it rather than rely on undocumented defaults.
+      permissionDecision: 'allow',
+      updatedInput: { ...toolInput, _voiceToken: voiceToken },
+    };
   }
   res.json(result);
 });
@@ -1198,6 +1359,61 @@ app.post('/api/hooks/post-tool', (req: Request, res: Response) => {
 
   const result = handleHookRequest('post-tool', session);
   res.json(result);
+});
+
+// Phrases that explicitly ask to start a voice conversation. Kept as a small,
+// literal allowlist rather than fuzzy/LLM-based intent detection — a false
+// positive here would auto-select a session the user didn't actually intend.
+const VOICE_START_PHRASES = ['会話開始'];
+// Allowed trailing politeness/particles. isVoiceStartCommand() requires the
+// ENTIRE trimmed message to be exactly phrase+suffix — nothing else — rather
+// than matching the phrase as a substring anywhere in a longer sentence.
+// Substring matching (even with negation/quote detection layered on) kept
+// matching things like "会話開始について説明して" or "会話開始なんてしない",
+// since natural language negation/mention isn't reliably a fixed pattern
+// right after the phrase. Requiring the whole message to be (close to) just
+// the command phrase avoids that whole category of false positive, at the
+// cost of not recognizing more elaborate phrasings of the same request.
+const VOICE_START_SUFFIXES = ['', 'して', 'してください', 'しよう', 'しましょう', 'をお願いします', 'お願いします', 'をお願い', 'お願い'];
+
+function isVoiceStartCommand(promptText: string): boolean {
+  // Strip trailing punctuation before matching — suffixes above cover the verb
+  // form itself, not every combination with a trailing "。"/"！"/"!" a user
+  // might also type (e.g. "会話開始してください。", "会話開始お願いします！").
+  const trimmed = promptText.trim().replace(/[。！!？?]+$/, '');
+  return VOICE_START_PHRASES.some(phrase =>
+    VOICE_START_SUFFIXES.some(suffix => trimmed === phrase + suffix)
+  );
+}
+
+// UserPromptSubmit hook endpoint — fires only for genuine interactive user
+// input (never for background/scheduled tasks or tool-forced speak() calls),
+// which makes it the one safe place to auto-select a session. See the note in
+// /api/speak for why auto-selecting on an unselected session's speak() call
+// was tried and reverted (backgroundVoiceEnforcement can force background
+// sessions to call speak(), which would let them claim it the same way).
+app.post('/api/hooks/user-prompt', (req: Request, res: Response) => {
+  logHookRequest(req, 'user-prompt');
+  const { key, sessionId } = parseHookRequest(req);
+  // The exact field name for this in the official Claude Code hooks docs
+  // (https://code.claude.com/docs/en/hooks) has been reported inconsistently
+  // across sources during development — accept both `prompt_text` and `prompt`
+  // so this trigger doesn't silently stop firing if either turns out to be wrong.
+  const promptText: string = req.body?.prompt_text || req.body?.prompt || '';
+
+  if (selectedSessionKey === null && isVoiceStartCommand(promptText)) {
+    // If the browser sent something (typed text, or a recognized utterance)
+    // before any real session had registered, resolveSessionForNewInput()
+    // would have bucketed it into the anonymous 'default' session (the only
+    // safe choice at the time — no real session existed yet to attribute it
+    // to). Now that a real session is being explicitly selected, bring that
+    // input along so it isn't silently stranded and never reaches Claude.
+    migrateDefaultSession(key, sessionId);
+    selectedSessionKey = key;
+    debugLog(`[Session] Auto-selected via UserPromptSubmit trigger phrase: ${key}`);
+  }
+
+  res.json({});
 });
 
 // API to clear all utterances
@@ -1303,7 +1519,10 @@ app.get('/api/tts-events', (req: Request, res: Response) => {
 // Only sends to clients watching the given session (or all clients if viewingKey is null).
 function notifyTTSClients(text: string, sessionKey?: string) {
   const targetKey = sessionKey || selectedSessionKey;
-  const message = JSON.stringify({ type: 'speak', text, sessionKey: targetKey });
+  // Tells the browser whether IT should speak this text via SpeechSynthesis.
+  // On macOS the WebSocket audio path (say + enqueueTts) already renders it —
+  // the browser must not also speak it, or the same text plays twice.
+  const message = JSON.stringify({ type: 'speak', text, sessionKey: targetKey, browserTtsEnabled: !IS_MACOS });
   ttsClients.forEach((viewingKey, client) => {
     // Send to clients watching the target session (null means "watching selected")
     if (viewingKey === null || viewingKey === targetKey) {
@@ -1522,14 +1741,19 @@ function handleWsControlMessage(client: WsAudioClient, msg: { type: string; [key
       break;
 
     case 'select-session': {
-      const previousKey = selectedSessionKey;
-      const newKey = msg.sessionKey as string;
+      // Updates only this WS connection's own recognition target (used by
+      // resolveSessionForNewInput() for THIS client's final transcripts). The
+      // global selectedSessionKey — which gates TTS/audio routing for everyone
+      // — is intentionally NOT set here. It used to be, which raced against the
+      // serialized POST /api/active-session flow in app.js's switchActiveSession:
+      // a fast WS message could set it, then a slower (but earlier-clicked)
+      // POST could set it back, leaving the two out of sync for as long as that
+      // POST took. The global selection now changes only via that POST, or via
+      // the UserPromptSubmit '会話開始' auto-select in /api/hooks/user-prompt.
+      const newKey = msg.sessionKey as string | null;
+      const previousKey = (client as any).selectedSessionKey;
       (client as any).selectedSessionKey = newKey;
-      // Browser selection is authoritative — update the server's selected session
-      if (newKey && sessions.has(newKey)) {
-        selectedSessionKey = newKey;
-      }
-      debugLog(`[WS] Browser selected session: ${previousKey} → ${newKey}`);
+      debugLog(`[WS] Client's own recognition target changed: ${previousKey} → ${newKey}`);
       break;
     }
 
@@ -1554,9 +1778,23 @@ function startRecognizerForClient(client: WsAudioClient): void {
       }));
     } else if (result.type === 'final' && result.text.trim()) {
       const utteranceId = randomUUID();
-      // Create utterance in the selected session (from WS client), falling back to active
+      // Create utterance in the selected session (from WS client) — see
+      // resolveSessionForNewInput() for why this doesn't fall back to "whichever
+      // session is first" when nothing is selected and more than one exists.
       const selectedKey = (client as any).selectedSessionKey;
-      const session = selectedKey && sessions.has(selectedKey) ? sessions.get(selectedKey)! : getActiveSessionOrFirst();
+      const session = resolveSessionForNewInput(selectedKey);
+      if (!session) {
+        // Structured so the client can recover the dropped speech into its text
+        // input (see the 'error' WS handler in app.js) instead of just logging it.
+        client.ws.send(JSON.stringify({
+          type: 'error',
+          code: 'no_session_selected',
+          message: 'Multiple sessions exist and none is selected — select a session before speaking',
+          text: result.text.trim(),
+        }));
+        debugLog(`[SpeechRecognizer] Dropped transcript, no session selected with multiple sessions active: "${result.text.trim()}"`);
+        return;
+      }
       session.queue.add(result.text.trim());
 
       client.ws.send(JSON.stringify({
@@ -1777,12 +2015,53 @@ app.get('/api/sessions', (_req: Request, res: Response) => {
 app.post('/api/active-session', (req: Request, res: Response) => {
   const { key } = req.body;
 
-  if (!key || !sessions.has(key)) {
+  if (!key) {
     res.status(400).json({ error: 'Invalid session key' });
     return;
   }
 
+  if (!sessions.has(key)) {
+    // Allow selecting a session that hasn't sent its first hook yet (e.g. picked
+    // from the Sessions panel right after a new Claude Code window opens), by
+    // creating its session record on demand instead of rejecting the selection.
+    // The key must round-trip through compositeKey() exactly — this rejects
+    // malformed/oversized/non-canonical payloads, not just non-JSON ones.
+    const MAX_SESSION_ID_LENGTH = 200;
+    const MAX_SESSIONS = 500;
+    let isValid = false;
+    try {
+      const parsed = JSON.parse(key);
+      if (
+        Array.isArray(parsed) && parsed.length === 2 &&
+        typeof parsed[0] === 'string' && parsed[0].length > 0 && parsed[0].length <= MAX_SESSION_ID_LENGTH &&
+        typeof parsed[1] === 'string' && parsed[1].length > 0 && parsed[1].length <= MAX_SESSION_ID_LENGTH &&
+        compositeKey(parsed[0], parsed[1] === 'main' ? null : parsed[1]) === key
+      ) {
+        isValid = true;
+      }
+    } catch (e) {
+      isValid = false;
+    }
+    if (!isValid) {
+      res.status(400).json({ error: 'Invalid session key' });
+      return;
+    }
+    if (sessions.size >= MAX_SESSIONS) {
+      res.status(409).json({ error: 'Too many sessions' });
+      return;
+    }
+    const [sessionIdFromKey, agentIdFromKey] = JSON.parse(key) as [string, string];
+    getOrCreateSession(key, sessionIdFromKey, agentIdFromKey === 'main' ? null : agentIdFromKey, null);
+  }
+
   const previousKey = selectedSessionKey;
+  if (previousKey === null) {
+    // See the identical migration in the UserPromptSubmit auto-select handler —
+    // input sent before any real session existed lands in the anonymous
+    // 'default' session; bring it along now that a real one is being selected.
+    const [migratedSessionId] = JSON.parse(key) as [string, string];
+    migrateDefaultSession(key, migratedSessionId);
+  }
   selectedSessionKey = key;
   debugLog(`[Session] Selected changed: ${previousKey} → ${key}`);
 
@@ -1794,7 +2073,7 @@ app.post('/api/active-session', (req: Request, res: Response) => {
 
 // API for text-to-speech
 app.post('/api/speak', async (req: Request, res: Response) => {
-  const { text } = req.body;
+  const { text, voiceToken } = req.body;
 
   if (!text || !text.trim()) {
     res.status(400).json({ error: 'Text is required' });
@@ -1811,15 +2090,43 @@ app.post('/api/speak', async (req: Request, res: Response) => {
     return;
   }
 
-  // Check whitelist: only speak via TTS if text was approved by pre-speak hook
-  // Skip whitelist check if no session exists yet (single session backward compat)
+  // Identify which session actually made this call, so conversation history is
+  // attributed correctly and (below) an unselected controller can be claimed.
+  // Preferred: the single-use token the pre-speak hook injected into this exact
+  // tool call via updatedInput (see issueSpeakToken) — immune to two sessions
+  // speaking the same text. Falls back to the older text-keyed whitelist if the
+  // token is missing (e.g. an MCP client where updatedInput injection didn't apply).
   let whitelistSessionKey: string | undefined;
-  if (selectedSessionKey !== null) {
+  let matched = false;
+  if (typeof voiceToken === 'string' && voiceToken) {
+    const tokenSessionKey = consumeSpeakToken(voiceToken);
+    if (tokenSessionKey) {
+      whitelistSessionKey = tokenSessionKey;
+      matched = true;
+      // The pre-speak hook always adds a whitelist entry alongside issuing the
+      // token (see /api/hooks/pre-speak), so one exists here too. Consume THIS
+      // session's specific entry now (not just any entry for this text) rather
+      // than leaving it to be matched later — if two sessions speak the exact
+      // same text around the same time and this text's token path succeeds for
+      // one of them, a stale un-consumed whitelist entry for the other could
+      // otherwise be picked up by an unrelated later call for that same text.
+      consumeWhitelistEntryForSession(text, tokenSessionKey);
+    }
+  }
+  if (!matched) {
     const whitelistResult = checkWhitelist(text);
-    if (!whitelistResult.matched) {
-      // Not whitelisted — unexpected since pre-speak now always whitelists.
-      // Return success silently to avoid confusing the agent.
-      debugLog(`[Speak] Non-whitelisted text, returning success without TTS: "${text.slice(0, 30)}..."`);
+    if (whitelistResult.matched) {
+      whitelistSessionKey = whitelistResult.sessionKey;
+      matched = true;
+    }
+  }
+  if (!matched) {
+    if (selectedSessionKey !== null || countRealSessions() > 1) {
+      // Not identified — unexpected since pre-speak now always whitelists/tokens.
+      // With multiple sessions and no match, we also have no safe way to guess
+      // which one this belongs to, so don't attribute it to any of them. Return
+      // success silently to avoid confusing the agent.
+      debugLog(`[Speak] Unidentified text, returning success without TTS: "${text.slice(0, 30)}..."`);
       res.json({
         success: true,
         message: 'Text spoken successfully',
@@ -1827,13 +2134,36 @@ app.post('/api/speak', async (req: Request, res: Response) => {
       });
       return;
     }
-    whitelistSessionKey = whitelistResult.sessionKey;
+    // No session selected yet, and at most one real session exists — single-
+    // session backward compat: identify it explicitly so the auto-select below
+    // also covers this case, then let getActiveSessionOrFirst() below resolve it.
+    const only = getSingleRealSession();
+    if (only) whitelistSessionKey = only.key;
   }
+
+  // NOTE: session auto-selection does NOT happen here. An earlier version of
+  // this code claimed selectedSessionKey on any unselected session's first
+  // speak() call, reasoning that background/scheduled tasks never call speak.
+  // That reasoning was wrong: backgroundVoiceEnforcement (see /api/hooks/stop)
+  // can *force* an unselected background session to call speak() before its
+  // Stop hook approves, which would let it silently steal the active
+  // conversation — the same class of hijack autoSelectIfNone caused, via this
+  // new path instead. Session selection now happens only via an explicit
+  // trigger tied to genuine user input: see the VOICE_START_PHRASES ('会話開始')
+  // handling in the /api/hooks/user-prompt (UserPromptSubmit) endpoint below.
 
   // Only play TTS audio if the speaking session is the one the browser has selected.
   // Background sessions get their text stored in conversation history but no audio.
+  // When nothing is selected yet, only fall back to "play it" when there's no
+  // ambiguity about who's speaking (exactly one session exists) — otherwise an
+  // unrelated background session (e.g. a scheduled task) could have its speech
+  // routed to audio before anyone manually picks a session in the Sessions panel
+  // (this is the same class of hijack as the disabled autoSelectIfNone, via a
+  // different code path).
   const speakingSessionKey = whitelistSessionKey || selectedSessionKey;
-  const isBrowserSelected = !selectedSessionKey || speakingSessionKey === selectedSessionKey;
+  const isBrowserSelected = selectedSessionKey
+    ? speakingSessionKey === selectedSessionKey
+    : countRealSessions() <= 1;
 
   try {
     // Use the session from the whitelist entry (the session that pre-speak approved),
@@ -1847,10 +2177,15 @@ app.post('/api/speak', async (req: Request, res: Response) => {
       notifyTTSClients(text, speakingSessionKey || undefined);
       debugLog(`[Speak] Sent text to browser: "${text}"`);
 
-      // Render TTS audio via macOS say command and stream over WebSocket
-      enqueueTts(text, voicePreferences.speechRate, speakingSessionKey).catch(err => {
-        debugLog(`[Speak] Failed to render system voice audio: ${err}`);
-      });
+      // Render TTS audio via macOS say command and stream over WebSocket.
+      // Skipped on Windows, where `say` doesn't exist and the browser's own
+      // SpeechSynthesis (driven by the SSE event above) is the only real path —
+      // running both would double-play on any platform where `say` succeeds.
+      if (IS_MACOS) {
+        enqueueTts(text, voicePreferences.speechRate, speakingSessionKey).catch(err => {
+          debugLog(`[Speak] Failed to render system voice audio: ${err}`);
+        });
+      }
     } else {
       // Background session — store in conversation history but no TTS audio
       debugLog(`[Speak] Background session ${speakingSessionKey} — storing without TTS: "${text.slice(0, 30)}..."`);
@@ -1896,8 +2231,15 @@ app.post('/api/test-voice', async (req: Request, res: Response) => {
     return;
   }
   try {
+    // Browser SpeechSynthesis (Windows fallback, driven by this SSE event) and the
+    // say-based WebSocket audio path are mutually exclusive by platform — see
+    // IS_MACOS above and the matching guard in /api/speak.
     notifyTTSClients(text);
-    await enqueueTts(text, voicePreferences.speechRate);
+    if (IS_MACOS) {
+      enqueueTts(text, voicePreferences.speechRate).catch(err => {
+        debugLog(`[TestVoice] Failed to render system voice audio: ${err}`);
+      });
+    }
     res.json({ success: true });
   } catch (error) {
     debugLog(`[TestVoice] Failed: ${error}`);
@@ -2136,6 +2478,10 @@ if (IS_MCP_MANAGED) {
     try {
       if (name === 'speak') {
         const text = args?.text as string;
+        // Injected by the pre-speak PreToolUse hook via hookSpecificOutput.updatedInput
+        // (see issueSpeakToken) — identifies which session this call belongs to
+        // without relying on matching the spoken text itself.
+        const voiceToken = args?._voiceToken as string | undefined;
 
         if (!text || !text.trim()) {
           return {
@@ -2152,7 +2498,7 @@ if (IS_MCP_MANAGED) {
         const response = await fetch(`http://localhost:${HTTP_PORT}/api/speak`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, voiceToken }),
         });
 
         const data = await response.json() as any;
