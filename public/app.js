@@ -107,7 +107,6 @@ class MessengerClient {
         this._ttsRetryTimer = null;
         this._ttsQueue = [];
         this._ttsPlaying = false;
-        this._ttsWasListening = false;
 
         // Mic-capture mute has two independent reasons that can both be active
         // at once — browser TTS (_ttsSpeaking, above) and WS/say-based audio
@@ -149,6 +148,19 @@ class MessengerClient {
         this.isListening = false;
         this.isInterimText = false;
         this.debug = localStorage.getItem('voiceHooksDebug') === 'true';
+        this._recognitionRestartAttempts = 0; // see _scheduleRecognitionRestart()
+        this._recognitionRestartTimer = null; // single in-flight restart, never two racing timers
+        this._recognitionSettleTimer = null; // see recognition.onstart
+        // 'idle' | 'starting' | 'running'. 'starting' covers the gap between start()
+        // returning and onstart firing, during which stop() and a second start() are
+        // both unsafe. Maintained wherever recognition is started or ends.
+        this._recognitionState = 'idle';
+        this._recognitionStopFallbackTimer = null; // see _stopRecognition()
+        this._voiceSessionGeneration = 0; // bumped by every mic on/off; see startVoiceDictation()
+        this._recognitionAbortedForEcho = false; // see _discardEchoedRecognitionAudio()
+        this._ttsBurstSpoke = false; // did anything actually play in this speaking burst
+        this._echoDiscardUntil = 0; // fallback echo window when abort() failed
+        this._recognitionLifecycleGeneration = 0; // see _armRecognitionStopFallback()
 
         // TTS state
         this.speechRate = 1.0;
@@ -228,6 +240,7 @@ class MessengerClient {
                     // `say` on macOS (browserTtsEnabled is false there), so only speak
                     // here when the server says nothing else will play this text —
                     // otherwise it plays twice.
+                    this.debugLog('[VoiceDiag] SSE speak event received, browserTtsEnabled=%s textLength=%s', data.browserTtsEnabled, (data.text || '').length);
                     if (data.browserTtsEnabled) {
                         this.speakViaBrowser(data.text);
                     }
@@ -854,6 +867,7 @@ class MessengerClient {
     // stopVoiceDictation(), which used to unconditionally clear the input
     // box right after calling this, wiping out the 409 restore below).
     async sendMessage(text) {
+        if (!text || !text.trim()) return false; // the server rejects these with 400
         try {
             const response = await fetch(`${this.baseUrl}/api/potential-utterances`, {
                 method: 'POST',
@@ -898,33 +912,59 @@ class MessengerClient {
                 this.isInterimText = false;
             }
 
+            // Both toggles bump this. Checking isListening after an await isn't enough
+            // on its own: an off-then-on double tap leaves it true again, so a stale
+            // start would sail past and re-enable the WebSocket and server-side voice
+            // behind the newer one.
+            const generation = ++this._voiceSessionGeneration;
+
             this.isListening = true;
             this.micBtn.classList.add('listening');
+            this._recognitionRestartAttempts = 0; // explicit new user intent — start clean
+            this._cancelScheduledRecognitionRestart();
 
             // Unlock AudioPlayer on user gesture (iOS Safari requirement)
             await this.audioPlayer.unlock();
+            if (generation !== this._voiceSessionGeneration) return; // superseded while awaiting
 
             // Open WebSocket; audio capture starts from the onopen callback
             this.connectAudioWebSocket();
 
-            // Start browser speech recognition only if NOT using server recognition
-            if (!this.useServerRecognition && this.recognition) {
-                this.recognition.start();
+            // Start browser speech recognition only if NOT using server recognition.
+            // TTS may have started while the await above was pending — re-check
+            // _ttsSpeaking rather than starting into it; the TTS-end resume path
+            // (advance()/_cancelBrowserTts) picks this up once it's done, since
+            // isListening is already true by then.
+            if (!this.useServerRecognition && this.recognition && !this._ttsSpeaking && this._recognitionState === 'idle') {
+                this._recognitionState = 'starting';
+                try {
+                    this.recognition.start();
+                } catch (e) {
+                    // Usually InvalidStateError from a recognizer that hasn't finished
+                    // winding down. Hand it to the same backoff the error paths use
+                    // rather than aborting the whole start and leaving the mic lit but
+                    // deaf — the user asked to listen and nothing here says they can't.
+                    this._recognitionState = 'idle';
+                    console.error('Failed to start recognition:', e);
+                    this._recognitionRestartAttempts++;
+                    this._scheduleRecognitionRestart();
+                }
             }
 
+            if (generation !== this._voiceSessionGeneration) return; // superseded while awaiting
             // Activate voice input and voice responses when mic is on
             await this.updateVoiceActive(true);
         } catch (e) {
-            console.error('Failed to start recognition:', e);
+            console.error('Failed to start voice dictation:', e);
             alert('Failed to start speech recognition');
         }
     }
 
     async stopVoiceDictation() {
+        const generation = ++this._voiceSessionGeneration;
         this.isListening = false;
-        if (this.recognition) {
-            this.recognition.stop();
-        }
+        this._cancelScheduledRecognitionRestart();
+        this._stopRecognition();
         this.micBtn.classList.remove('listening');
 
         // Send any accumulated text in the input (from browser recognition)
@@ -935,6 +975,11 @@ class MessengerClient {
             // On failure, sendMessage already restored/left the text in place
             // (e.g. the 409 "select a session" case) — don't wipe it out here.
         }
+
+        // The mic may have been switched back on while that send was in flight — in
+        // which case neither the input box nor the connection belongs to this stop
+        // any more, so touch nothing.
+        if (generation !== this._voiceSessionGeneration) return;
 
         this.isInterimText = false;
         this.messageInput.style.height = 'auto';
@@ -961,24 +1006,41 @@ class MessengerClient {
         this.recognition.lang = 'ja-JP';
 
         this.recognition.onresult = (event) => {
+            // A real result is the actual proof the recognizer is healthy — onstart
+            // firing is not enough, since a persistently failing setup (e.g. a
+            // network error right after every start) would still fire onstart each
+            // time and never let the backoff in _scheduleRecognitionRestart grow.
+            this._recognitionRestartAttempts = 0;
             // Skip browser recognition results when using server recognition
             if (this.useServerRecognition) return;
             // Skip results while Claude is speaking, to avoid picking up speaker echo
             if (this._ttsSpeaking) return;
+            // Set only when the post-reply abort failed, so the recognizer is still
+            // holding Claude's own voice (see _discardEchoedRecognitionAudio).
+            if (this._echoDiscardUntil && Date.now() < this._echoDiscardUntil) return;
 
+            // Collect finals and interims separately, then send once. Reading the
+            // text back out of messageInput instead meant a final that arrived
+            // without a preceding interim (or whose interims were dropped while
+            // _ttsSpeaking) posted an empty string, which the server rejects with
+            // 400 "Text is required"; several finals in one event also posted twice.
             let interimTranscript = '';
+            let finalTranscript = '';
 
             for (let i = event.resultIndex; i < event.results.length; i++) {
                 const transcript = event.results[i][0].transcript;
 
                 if (event.results[i].isFinal) {
-                    this.isInterimText = false;
-                    const finalText = this.messageInput.value.trim();
-                    this.sendMessage(finalText);
-                    this.messageInput.value = '';
+                    finalTranscript += transcript;
                 } else {
                     interimTranscript += transcript;
                 }
+            }
+
+            if (finalTranscript.trim()) {
+                this.isInterimText = false;
+                this.sendMessage(finalTranscript.trim());
+                this.messageInput.value = '';
             }
 
             if (interimTranscript) {
@@ -988,24 +1050,203 @@ class MessengerClient {
             }
         };
 
+        this.recognition.onstart = () => {
+            this._recognitionState = 'running';
+            this.debugLog('[VoiceDiag] recognition.onstart isListening=%s ttsSpeaking=%s', this.isListening, this._ttsSpeaking);
+            if (!this.isListening) {
+                // The mic was switched off while this session was still 'starting', so
+                // the stop() issued back then may have thrown (nothing was running yet)
+                // and left no live recognizer to stop. Now that one genuinely exists,
+                // stop it for real instead of leaving it listening behind a dark button.
+                this._stopRecognition();
+                return;
+            }
+            // A session that merely *starts* isn't proof it's healthy — a persistent
+            // failure can start and immediately error/end again. Arm a settle timer
+            // instead: only forgive past failures once a session has actually run
+            // for a while without incident (onresult below is the other, stronger
+            // signal — an actual recognized result — and resets immediately).
+            clearTimeout(this._recognitionSettleTimer);
+            this._recognitionSettleTimer = setTimeout(() => {
+                this._recognitionRestartAttempts = 0;
+                this.debugLog('[VoiceDiag] recognition settled, resetting restart attempts');
+            }, 3000);
+        };
+
         this.recognition.onerror = (event) => {
-            if (event.error !== 'no-speech') {
-                console.error('Speech error:', event.error);
+            this.debugLog('[VoiceDiag] recognition.onerror error=%s isListening=%s ttsSpeaking=%s useServerRecognition=%s', event.error, this.isListening, this._ttsSpeaking, this.useServerRecognition);
+            clearTimeout(this._recognitionSettleTimer); // this session didn't survive long enough to count as healthy
+            if (event.error === 'no-speech') return;
+            console.error('Speech error:', event.error);
+            // stopVoiceDictation() also disables voiceActive server-wide (see
+            // updateVoiceActive), which makes the `speak` MCP tool fail outright —
+            // so a transient recognition error here was silencing Claude's TTS too,
+            // not just dropping mic input. Errors that won't resolve on their own
+            // (permission denied, no working input device, an unsupported language)
+            // still hard-stop immediately; genuinely transient ones (network blips,
+            // an aborted recognition cycle) are left to onend's capped-backoff restart
+            // below, which keeps retrying for as long as the mic is on.
+            const FATAL_ERRORS = ['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported', 'bad-grammar'];
+            if (FATAL_ERRORS.includes(event.error)) {
                 this.stopVoiceDictation();
             }
         };
 
         this.recognition.onend = () => {
-            // Only restart browser recognition if listening, not using server, and Claude isn't speaking
-            if (this.isListening && !this.useServerRecognition && !this._ttsSpeaking) {
-                try {
-                    this.recognition.start();
-                } catch (e) {
-                    console.error('Failed to restart recognition:', e);
-                    this.stopVoiceDictation();
-                }
-            }
+            this._recognitionState = 'idle';
+            this._cancelRecognitionStopFallback();
+            this.debugLog('[VoiceDiag] recognition.onend isListening=%s ttsSpeaking=%s useServerRecognition=%s attempts=%s', this.isListening, this._ttsSpeaking, this.useServerRecognition, this._recognitionRestartAttempts);
+            clearTimeout(this._recognitionSettleTimer); // ending (outside a deliberate stop) means it didn't settle either
+            // Only restart browser recognition if listening, not using server, and Claude isn't speaking.
+            // Recognition is no longer stopped for TTS, so reaching here during TTS means it ended on
+            // its own; the post-TTS resume in _processTtsQueue's advance() picks it back up.
+            const wasEchoAbort = this._recognitionAbortedForEcho;
+            this._recognitionAbortedForEcho = false;
+            if (!this.isListening || this.useServerRecognition || this._ttsSpeaking) return;
+            // Each onend that requires a restart counts as one failed cycle, whether
+            // or not the restart attempt itself then throws synchronously — a
+            // recognizer that starts fine but errors/ends again moments later
+            // (e.g. a persistent network problem) must still count toward the cap.
+            // A deliberate echo abort isn't a failure, though: counting those would
+            // grow the backoff with every reply until the mic took 30s to come back.
+            if (!wasEchoAbort) this._recognitionRestartAttempts++;
+            this._scheduleRecognitionRestart();
         };
+    }
+
+    // Stops browser recognition and makes sure _recognitionState gets back to 'idle'
+    // whatever the API does. stop() on an already-stopped recognizer can throw, and
+    // callers must not have that escape (stopVoiceDictation would skip the rest of
+    // its teardown); onend can also simply never arrive, which would pin the state at
+    // 'running' and make every later start() — including the user switching the mic
+    // back on — fall foul of the idle guards.
+    _stopRecognition() {
+        // Drop any fallback still pending from an earlier stop or echo abort before
+        // taking any early return, so it can't fire against a later session.
+        this._cancelRecognitionStopFallback();
+        if (!this.recognition || this._recognitionState === 'idle') return;
+        const generation = ++this._recognitionLifecycleGeneration;
+        try {
+            this.recognition.stop();
+            this._armRecognitionStopFallback(generation, 'stop');
+        } catch (e) {
+            console.error('Failed to stop recognition:', e);
+            this._recognitionState = 'idle';
+            this._recognitionAbortedForEcho = false;
+        }
+    }
+
+    _cancelRecognitionStopFallback() {
+        clearTimeout(this._recognitionStopFallbackTimer);
+        this._recognitionStopFallbackTimer = null;
+    }
+
+    // stop()/abort() should both deliver onend promptly. When one doesn't, the state
+    // would stay non-idle and every later start() — including the user simply switching
+    // the mic back on — would be refused by the idle guards. The generation check keeps
+    // a timer armed for one lifecycle from touching the next one.
+    _armRecognitionStopFallback(generation, label) {
+        // onend can arrive synchronously from stop()/abort(), in which case there's
+        // nothing left to guard against.
+        if (this._recognitionState === 'idle') return;
+        const timer = setTimeout(() => {
+            // Own both the handle and the lifecycle, or do nothing: a callback that was
+            // already queued when its timer got cleared must not clear a newer timer's
+            // handle or touch a session it no longer belongs to.
+            if (this._recognitionStopFallbackTimer !== timer) return;
+            if (generation !== this._recognitionLifecycleGeneration) return;
+            this._recognitionStopFallbackTimer = null;
+            if (this._recognitionState === 'idle') return;
+            console.warn(`[Recognition] No onend after ${label}(); forcing state back to idle`);
+            this._recognitionState = 'idle';
+            this._recognitionAbortedForEcho = false;
+            if (this.isListening) this._scheduleRecognitionRestart();
+        }, 3000);
+        this._recognitionStopFallbackTimer = timer;
+    }
+
+    // Recognition deliberately keeps listening through a reply (see _processTtsQueue),
+    // so by the time a reply finishes the recognizer is holding a buffer of Claude's
+    // own voice off the speakers, which it would deliver as a final result the moment
+    // it settles — Claude answering itself. abort() drops that buffer without emitting
+    // it; onend then brings recognition straight back.
+    //
+    // This runs when a reply *ends*, which is what keeps it safe: a wedged synthesiser
+    // never gets here, so it can never strand the mic the way stopping at reply start did.
+    _discardEchoedRecognitionAudio() {
+        if (this.useServerRecognition || !this.recognition) return;
+        if (this._recognitionState === 'idle') return;
+        // Nothing was ever audible in this burst (a synthesiser that never started —
+        // see the onstart watchdog), so there is no echo to drop, and aborting would
+        // throw away whatever the user actually said during the silence.
+        if (!this._ttsBurstSpoke) return;
+        this._cancelRecognitionStopFallback();
+        this._recognitionAbortedForEcho = true;
+        const generation = ++this._recognitionLifecycleGeneration;
+        try {
+            this.recognition.abort();
+            this._armRecognitionStopFallback(generation, 'abort');
+        } catch (e) {
+            this._recognitionAbortedForEcho = false;
+            console.error('Failed to abort recognition after TTS:', e);
+            // The buffer wasn't discarded after all, so the reply is still going to
+            // come back as a result. Drop results briefly rather than answering it.
+            this._echoDiscardUntil = Date.now() + 1500;
+        }
+    }
+
+    // Cancels a pending restart without running it. Called when the user turns the mic
+    // off or explicitly starts a fresh session, so a stale timer can't fire start() on
+    // top of a state that moved on.
+    _cancelScheduledRecognitionRestart() {
+        if (this._recognitionRestartTimer) {
+            clearTimeout(this._recognitionRestartTimer);
+            this._recognitionRestartTimer = null;
+        }
+        clearTimeout(this._recognitionSettleTimer);
+    }
+
+    // Exponential backoff restart, capped at the same 30s ceiling scheduleWsReconnect
+    // uses, and — like that reconnect loop — it keeps trying for as long as the mic
+    // is on rather than giving up after a fixed number of attempts.
+    //
+    // Giving up used to call stopVoiceDictation(), which also disables voiceActive
+    // server-side, so a run of transient `network` errors from Chrome's speech
+    // backend took out Claude's *replies* as well as the mic, leaving the mic button
+    // dark and the session mute with no way to explain itself. The user pressing the
+    // mic button is a standing "I want to be listening" instruction: honour it until
+    // they press it again. Errors that genuinely can't recover (permission denied, no
+    // input device, unsupported language) still stop everything from onerror above.
+    //
+    // _recognitionRestartTimer makes this a single in-flight sequence: the three
+    // call sites (recognition.onend, post-TTS resume, _cancelBrowserTts) can all
+    // ask for a restart, but only one timer is ever pending, so two independent
+    // backoff series can never both call start() on the same recognizer.
+    // _recognitionRestartAttempts is intentionally NOT reset immediately here or
+    // on recognition.onstart — only a genuine onresult, 3s of settled runtime
+    // (see the onstart settle timer above), or an explicit new startVoiceDictation()
+    // proves the recognizer actually recovered.
+    _scheduleRecognitionRestart() {
+        if (this._recognitionRestartTimer) return; // already have one in flight
+        if (this._recognitionState !== 'idle') return; // start() on a live recognizer throws InvalidStateError
+        if (!this.isListening || this.useServerRecognition || this._ttsSpeaking) return;
+        const delay = Math.min(30000, 250 * Math.pow(2, this._recognitionRestartAttempts));
+        this._recognitionRestartTimer = setTimeout(() => {
+            this._recognitionRestartTimer = null;
+            if (this._recognitionState !== 'idle') return;
+            if (!this.isListening || this.useServerRecognition || this._ttsSpeaking) return;
+            this._recognitionState = 'starting';
+            try {
+                this.recognition.start();
+                this.debugLog('[VoiceDiag] recognition restart succeeded after %sms (attempt %s)', delay, this._recognitionRestartAttempts);
+            } catch (e) {
+                this._recognitionState = 'idle';
+                this._recognitionRestartAttempts++;
+                this.debugLog('[VoiceDiag] recognition restart threw (attempt %s):', this._recognitionRestartAttempts, e && e.name, e && e.message);
+                console.error('Failed to restart recognition:', e);
+                this._scheduleRecognitionRestart();
+            }
+        }, delay);
     }
 
     async deleteMessage(messageId) {
@@ -1043,15 +1284,26 @@ class MessengerClient {
         }
         this._ttsQueue = [];
         this._ttsGeneration++; // invalidate any in-flight/queued utterance's callbacks
-        window.speechSynthesis.cancel();
+        // Only cancel when there is actually something to cancel. This is called on
+        // every SSE error (see eventSource.onerror), so a flapping SSE connection
+        // fired a long run of no-op cancel() calls. Chrome's speech synthesis service
+        // has been observed wedging in this session — speak() silently does nothing
+        // and fires no start/end/error events at all, and since the service is per
+        // browser process rather than per tab, reloading the page does not clear it.
+        // Whether the no-op cancels caused that is unproven, but they buy nothing, so
+        // don't issue them.
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+            window.speechSynthesis.cancel();
+        }
         this._ttsPlaying = false;
         if (!this._ttsSpeaking) return; // browser TTS wasn't actually muting anything right now
         this._ttsSpeaking = false;
         this._updateMicMuted(); // still respects _wsAudioMuted if that's separately active
+        this._discardEchoedRecognitionAudio(); // speech did play before this clear, so it was heard
         if (this.isListening) {
             if (this.micBtn) this.micBtn.classList.add('listening');
             if (!this.useServerRecognition && this.recognition) {
-                try { this.recognition.start(); } catch (e) {}
+                this._scheduleRecognitionRestart();
             }
         }
     }
@@ -1063,6 +1315,7 @@ class MessengerClient {
     // whenever two `speak` events arrived close together. This queue keeps that
     // cancel() scoped to explicit clears (_cancelBrowserTts) only.
     speakViaBrowser(text) {
+        this.debugLog('[VoiceDiag] speakViaBrowser called, hasSpeechSynthesis=%s textLength=%s', !!window.speechSynthesis, (text || '').length);
         if (!window.speechSynthesis || !text) return;
         this._ttsQueue.push({ text, generation: this._ttsGeneration });
         this._processTtsQueue();
@@ -1117,13 +1370,17 @@ class MessengerClient {
             // First utterance of this speaking burst — mute the mic once for the
             // whole queue, not per-utterance, so back-to-back speech doesn't
             // flicker the mic on/off between items.
-            this._ttsWasListening = this.isListening;
+            //
+            // Echo suppression is _micMuted (which stops the WS audio stream) plus
+            // the _ttsSpeaking guard in recognition.onresult, which is what the
+            // design docs assign that job to. Recognition itself is deliberately
+            // NOT stopped here: stopping and restarting it around every reply made
+            // the mic depend on TTS completing cleanly, so a wedged speech
+            // synthesis engine — which never fires onend or onerror — stranded the
+            // mic off with no way back short of a page reload.
             this._ttsSpeaking = true;
+            this._ttsBurstSpoke = false; // set by utterance.onstart; see _discardEchoedRecognitionAudio
             this._updateMicMuted();
-            if (this.micBtn) this.micBtn.classList.remove('listening');
-            if (this.recognition) {
-                try { this.recognition.stop(); } catch (e) {}
-            }
         }
 
         const utterance = new SpeechSynthesisUtterance(item.text);
@@ -1137,16 +1394,32 @@ class MessengerClient {
         utterance.pitch = 1.0;
         const voices = window.speechSynthesis.getVoices();
         const jaVoices = voices.filter((v) => v.lang && v.lang.startsWith('ja'));
-        const priorityNames = ['Google 日本語', 'Haruka', 'Nanami', 'Ayumi'];
+        // Prefer a voice the machine renders itself. "Google 日本語" sounds better but
+        // is synthesised on Google's servers, so on a machine whose Chrome can't reach
+        // them it produces silence with no error and no events at all — indistinguishable
+        // from a wedged synthesiser, and the reason this only ever worked in Brave
+        // (which ships no Google voices and so fell through to a local one).
+        const localJaVoices = jaVoices.filter((v) => v.localService);
+        const pool = localJaVoices.length ? localJaVoices : jaVoices;
+        const priorityNames = ['Haruka', 'Nanami', 'Ayumi', 'Google 日本語'];
         let preferred = null;
         for (const name of priorityNames) {
-            preferred = jaVoices.find((v) => v.name.includes(name));
+            preferred = pool.find((v) => v.name.includes(name));
             if (preferred) break;
         }
-        if (!preferred) preferred = jaVoices[0];
+        if (!preferred) preferred = pool[0];
         if (preferred) utterance.voice = preferred;
 
-        const advance = () => {
+        this.debugLog('[VoiceDiag] speaking utterance, jaVoiceCount=%s chosenVoice=%s speaking=%s pending=%s paused=%s', jaVoices.length, preferred && preferred.name, window.speechSynthesis.speaking, window.speechSynthesis.pending, window.speechSynthesis.paused);
+
+        let settled = false;
+        const advance = (evt) => {
+            // onend/onerror and the watchdog below race each other; whichever lands
+            // first owns this utterance's completion.
+            if (settled) return;
+            settled = true;
+            clearTimeout(watchdog);
+            this.debugLog('[VoiceDiag] utterance %s fired, error=%s generation=%s currentGeneration=%s', evt && evt.type, evt && evt.error, generation, this._ttsGeneration);
             // Check generation BEFORE touching _ttsPlaying: cancel() delivers this
             // utterance's onend/onerror asynchronously, so a stale callback can still
             // arrive after a newer utterance has already started (and is genuinely
@@ -1158,10 +1431,17 @@ class MessengerClient {
                 // Nothing left to speak in this generation — resume the mic
                 this._ttsSpeaking = false;
                 this._updateMicMuted();
-                if (this._ttsWasListening && this.isListening) {
+                this._discardEchoedRecognitionAudio();
+                this.debugLog('[VoiceDiag] queue drained, resuming mic: isListening=%s recognitionState=%s', this.isListening, this._recognitionState);
+                // The desired state comes from isListening alone — the user's standing
+                // "I want to be listening". Gating on a snapshot taken when this burst
+                // started meant turning the mic on *during* a reply left it stuck off.
+                if (this.isListening) {
                     if (this.micBtn) this.micBtn.classList.add('listening');
-                    if (!this.useServerRecognition && this.recognition) {
-                        try { this.recognition.start(); } catch (e) {}
+                    // Recognition normally kept running through the reply; only restart
+                    // it if it actually ended (e.g. a network error) while we spoke.
+                    if (!this.useServerRecognition && this.recognition && this._recognitionState === 'idle') {
+                        this._scheduleRecognitionRestart();
                     }
                 }
             }
@@ -1170,19 +1450,64 @@ class MessengerClient {
         utterance.onend = advance;
         utterance.onerror = advance;
 
+        // Chrome's speech synthesis service can wedge (see _cancelBrowserTts): speak()
+        // returns normally but the utterance never starts and NO event ever fires —
+        // not even onerror. Two separate timers, because "never started" and "started
+        // but never finished" need very different budgets: a healthy engine begins an
+        // utterance almost immediately once the queue is empty, so a few seconds of
+        // silence from onstart is already conclusive, whereas a real utterance
+        // legitimately takes as long as its text is long.
+        const START_TIMEOUT_MS = 3000;
+        let watchdog = setTimeout(() => {
+            console.warn(`[TTS] onstart never fired within ${START_TIMEOUT_MS}ms — speech synthesis appears wedged; dropping queued speech and resuming mic`);
+            // Nothing is going to come out of this engine right now, so drop the whole
+            // queue rather than feeding each remaining item into the same stall (which
+            // would hold the mic through one timeout per item).
+            this._cancelBrowserTts();
+        }, START_TIMEOUT_MS);
+
+        utterance.onstart = () => {
+            clearTimeout(watchdog);
+            this._ttsBurstSpoke = true; // something really came out of the speakers
+            // A cancel (or the start timeout above) may have already retired this
+            // utterance; don't arm a completion timer for it in that case.
+            if (settled || generation !== this._ttsGeneration) return;
+            // Measured from actual start. Only the per-character part scales with
+            // rate — dividing the fixed grace too would leave barely a second at the
+            // slider's top setting. The divisor is also capped at 2 because engines
+            // flatten out well before the requested rate, so a "5x" utterance still
+            // takes far longer than a fifth of the time.
+            const effectiveRate = Math.min(2, Math.max(0.1, utterance.rate || 1));
+            const completionMs = 5000 + (item.text.length * 300) / effectiveRate;
+            watchdog = setTimeout(() => {
+                console.warn(`[TTS] Started but no end/error event after ${Math.round(completionMs)}ms — dropping queued speech and resuming mic`);
+                // Route through the same full reset as the start timeout: advance()
+                // alone would unmute the mic while speech may still be playing, and
+                // would queue the next utterance behind it.
+                this._cancelBrowserTts();
+            }, completionMs);
+        };
+
         window.speechSynthesis.speak(utterance);
     }
 
-    async updateVoiceActive(active) {
-        try {
-            await fetch(`${this.baseUrl}/api/voice-active`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ active })
-            });
-        } catch (error) {
-            console.error('Failed to update voice active state:', error);
-        }
+    // Serialized: two of these in flight at once (a quick mic off/on) could otherwise
+    // complete out of order and leave the server holding the older intent, with voice
+    // silently disabled behind a lit mic button. Chaining keeps them in call order, so
+    // the last toggle the user made is the last one the server sees.
+    updateVoiceActive(active) {
+        this._voiceActiveChain = (this._voiceActiveChain || Promise.resolve()).then(async () => {
+            try {
+                await fetch(`${this.baseUrl}/api/voice-active`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ active })
+                });
+            } catch (error) {
+                console.error('Failed to update voice active state:', error);
+            }
+        });
+        return this._voiceActiveChain;
     }
 
     async syncSelectedVoiceToServer() {
