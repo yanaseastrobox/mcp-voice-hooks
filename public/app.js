@@ -911,7 +911,7 @@ class MessengerClient {
     // Voice dictation
     toggleVoiceDictation() {
         if (this.isListening) {
-            this.stopVoiceDictation();
+            this.stopVoiceDictation(true);
         } else {
             this.startVoiceDictation();
         }
@@ -972,7 +972,7 @@ class MessengerClient {
         }
     }
 
-    async stopVoiceDictation() {
+    async stopVoiceDictation(byUser = false) {
         const generation = ++this._voiceSessionGeneration;
         this.isListening = false;
         this._cancelScheduledRecognitionRestart();
@@ -1000,8 +1000,8 @@ class MessengerClient {
         this.stopAudioCapture();
         this.disconnectAudioWebSocket();
 
-        // 読み上げ希望は変更しない。
-        await this.updateVoiceActive(false);
+        // 読み上げ希望は変更しない。本人がボタンで止めたときは待ち受けも即終了させる。
+        await this.updateVoiceActive(false, byUser);
     }
 
     initializeSpeechRecognition() {
@@ -1507,13 +1507,13 @@ class MessengerClient {
     // complete out of order and leave the server holding the older intent, with voice
     // silently disabled behind a lit mic button. Chaining keeps them in call order, so
     // the last toggle the user made is the last one the server sees.
-    updateVoiceActive(active) {
+    updateVoiceActive(active, byUser = false) {
         this._voiceActiveChain = (this._voiceActiveChain || Promise.resolve()).then(async () => {
             try {
                 await fetch(`${this.baseUrl}/api/voice-active`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ active })
+                    body: JSON.stringify({ active, byUser })
                 });
             } catch (error) {
                 console.error('Failed to update voice active state:', error);

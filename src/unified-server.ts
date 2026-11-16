@@ -517,6 +517,8 @@ class ServerAudioState {
 
 const serverAudioState = new ServerAudioState();
 
+let micStoppedByUser = false;
+
 // Centralized voice-active setter — updates both voicePreferences and ServerAudioState
 function setVoiceActive(active: boolean): void {
   voicePreferences.voiceActive = active;
@@ -969,9 +971,17 @@ async function waitForUtteranceCore(session?: SessionState) {
   // a brief mic drop (flaky mic, accidental toggle) shouldn't end a 30-minute wait.
   const MIC_OFF_GRACE_MS = 180 * 1000;
   let micOffSince: number | null = null;
+  const endWait = (message: string) => {
+    notifyWaitStatus(false);
+    return { success: true, utterances: [] as never[], message, waitTime: Date.now() - startTime, error: undefined as string | undefined, count: undefined as number | undefined };
+  };
 
   // Poll for utterances
   while (Date.now() - startTime < maxWaitMs) {
+    // Another session was explicitly selected: new input goes there, so this
+    // session must not keep its turn open (it would look stuck for 30 minutes).
+    if (selectedSessionKey !== null && selectedSessionKey !== s.key) return endWait('Another session was selected');
+    if (!voicePreferences.voiceActive && micStoppedByUser) return endWait('Voice input was stopped by the user');
     // Check if voice input is still active
     if (!voicePreferences.voiceActive) {
       // No browser/audio client connected at all (vs. one connected with the mic
@@ -2012,6 +2022,9 @@ app.post('/api/voice-active', (req: Request, res: Response) => {
   }
 
   setVoiceActive(active);
+  // The user pressing the mic button off is an explicit "stop listening":
+  // end any Stop-hook wait right away instead of after the flaky-mic grace period.
+  micStoppedByUser = !active && req.body.byUser === true;
 
   res.json({
     success: true,
