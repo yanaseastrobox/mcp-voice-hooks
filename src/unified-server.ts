@@ -978,10 +978,6 @@ async function waitForUtteranceCore(session?: SessionState) {
 
   // Poll for utterances
   while (Date.now() - startTime < maxWaitMs) {
-    // Another session was explicitly selected: new input goes there, so this
-    // session must not keep its turn open (it would look stuck for 30 minutes).
-    if (selectedSessionKey !== null && selectedSessionKey !== s.key) return endWait('Another session was selected');
-    if (!voicePreferences.voiceActive && micStoppedByUser) return endWait('Voice input was stopped by the user');
     // Check if voice input is still active
     if (!voicePreferences.voiceActive) {
       // No browser/audio client connected at all (vs. one connected with the mic
@@ -1048,6 +1044,13 @@ async function waitForUtteranceCore(session?: SessionState) {
         waitTime: Date.now() - startTime,
       };
     }
+
+    // Checked only AFTER the pending check above, so text sent just before
+    // switching sessions or pressing the mic off is still delivered.
+    // Another session was explicitly selected: new input goes there, so this
+    // session must not keep its turn open (it would look stuck for 30 minutes).
+    if (selectedSessionKey !== null && selectedSessionKey !== s.key) return endWait('Another session was selected');
+    if (!voicePreferences.voiceActive && micStoppedByUser) return endWait('Voice input was stopped by the user');
 
     // Wait 100ms before checking again, but wake immediately on client disconnect
     await new Promise<void>(resolve => {
@@ -1350,9 +1353,10 @@ app.post('/api/hooks/stop', async (req: Request, res: Response) => {
 
   // Broadcast "stopped" state when the stop hook truly approves
   // (no utterances delivered back — Claude's turn is ending)
-  if (result.decision === 'approve') {
+  if (result.decision === 'approve' && isSelectedKey(key)) {
     // Clear hookActive silently to avoid intermediate 'inactive' broadcast,
-    // then broadcast 'stopped' as the final state.
+    // then broadcast 'stopped' as the final state. Skipped when the wait ended
+    // because another session was selected: the UI now shows that session.
     serverAudioState.clearHookActiveSilent();
     broadcastVoiceState('stopped');
   }
@@ -2433,9 +2437,14 @@ if (!IS_MCP_MANAGED) httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
           if (process.env.MCP_VOICE_HOOKS_BROWSER !== 'default') {
             try {
               const child = await open(url, { app: { name: apps.chrome } });
+              // On Windows/macOS the child is a launcher (PowerShell / open -a)
+              // that spawns fine even when Chrome is missing; only its exit
+              // code tells. A launcher still running after 5s is treated as
+              // opened, to avoid a second tab (two tabs speak twice).
               opened = await new Promise<boolean>(resolve => {
-                child.once('error', () => resolve(false));
-                child.once('spawn', () => resolve(true));
+                const timer = setTimeout(() => resolve(true), 5000);
+                child.once('error', () => { clearTimeout(timer); resolve(false); });
+                child.once('exit', code => { clearTimeout(timer); resolve(code === 0); });
               });
             } catch (error) {
               debugLog('[Browser] Chrome not available, falling back to default browser:', error);
