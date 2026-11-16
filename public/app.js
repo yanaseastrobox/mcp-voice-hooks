@@ -222,6 +222,15 @@ class MessengerClient {
                     // This handles both initial connect and reconnect after server restart
                     console.log('[SSE] Connected to server, syncing voice state');
                     this.syncVoiceStateToServer();
+                } else if (data.type === 'voice-preferences') {
+                    this.loadVoiceResponses();
+                } else if (data.type === 'session-selected') {
+                    if (!this._sessionSwitchPending) {
+                        this.selectedSessionKey = data.key;
+                        this.loadSessions();
+                        this.conversationMessages.querySelectorAll('.message-bubble').forEach(el => el.remove());
+                        this.loadData();
+                    }
                 } else if (data.type === 'voice-state') {
                     // Server is the single source of truth for voice state
                     this.currentVoiceState = data.state;
@@ -358,11 +367,12 @@ class MessengerClient {
             const response = await fetch(`${this.baseUrl}/api/sessions`);
             if (!response.ok) return;
             const data = await response.json();
+            this.loadVoiceResponses();
             this.sessions = data.sessions || [];
             this.activeSessionKey = data.activeKey;
             this._confirmedSessionKey = data.activeKey; // this reflects the server's actual state
             // Set initial selection to active key, but never override user's choice
-            if (!this.selectedSessionKey) {
+            if (!this._sessionSwitchPending) {
                 this.selectedSessionKey = data.activeKey;
             }
 
@@ -424,7 +434,7 @@ class MessengerClient {
                 const isSubAgent = !!session.agentId;
                 const label = isSubAgent
                     ? (session.agentType || session.agentId || 'sub-agent')
-                    : this.formatSessionLabel(sessionId);
+                    : (session.displayName ? `${session.displayName} (${this.formatSessionLabel(sessionId)})` : this.formatSessionLabel(sessionId));
                 const unread = this.unreadCounts[session.key] || 0;
 
                 const classes = ['session-item'];
@@ -461,6 +471,7 @@ class MessengerClient {
     }
 
     switchActiveSession(key) {
+        this._sessionSwitchPending = true;
         this.selectedSessionKey = key;
         const requestId = ++this._sessionSwitchRequestId;
         // Update the WS-based recognizer's per-connection target immediately
@@ -512,6 +523,7 @@ class MessengerClient {
 
         if (requestId !== this._sessionSwitchRequestId) return; // superseded; a newer switch owns the UI now
 
+        this._sessionSwitchPending = false;
         if (!ok) {
             // Roll back the optimistic UI selection so it doesn't diverge from
             // what the server actually has selected (resolveSessionForNewInput()
@@ -866,13 +878,13 @@ class MessengerClient {
     // whether it's safe to clear their own copy of the text (see
     // stopVoiceDictation(), which used to unconditionally clear the input
     // box right after calling this, wiping out the 409 restore below).
-    async sendMessage(text) {
+    async sendMessage(text, source = 'typed') {
         if (!text || !text.trim()) return false; // the server rejects these with 400
         try {
             const response = await fetch(`${this.baseUrl}/api/potential-utterances`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text, timestamp: new Date().toISOString(), session: this.selectedSessionKey })
+                body: JSON.stringify({ text, source, timestamp: new Date().toISOString(), session: this.selectedSessionKey })
             });
 
             if (response.ok) {
@@ -952,7 +964,7 @@ class MessengerClient {
             }
 
             if (generation !== this._voiceSessionGeneration) return; // superseded while awaiting
-            // Activate voice input and voice responses when mic is on
+            // マイク状態だけを更新する。
             await this.updateVoiceActive(true);
         } catch (e) {
             console.error('Failed to start voice dictation:', e);
@@ -988,7 +1000,7 @@ class MessengerClient {
         this.stopAudioCapture();
         this.disconnectAudioWebSocket();
 
-        // Deactivate voice input and voice responses when mic is turned off
+        // 読み上げ希望は変更しない。
         await this.updateVoiceActive(false);
     }
 
@@ -1039,7 +1051,7 @@ class MessengerClient {
 
             if (finalTranscript.trim()) {
                 this.isInterimText = false;
-                this.sendMessage(finalTranscript.trim());
+                this.sendMessage(finalTranscript.trim(), 'speech');
                 this.messageInput.value = '';
             }
 
@@ -1524,8 +1536,34 @@ class MessengerClient {
 
     async syncVoiceStateToServer() {
         // Re-send current browser voice state to the server after a session reset
-        await this.updateVoiceActive(this.isListening);
+        await this.loadVoiceResponses();
+        if (this.isListening) await this.updateVoiceActive(true);
         await this.syncSelectedVoiceToServer();
+    }
+
+    async loadVoiceResponses() {
+        if (this._voiceResponsesUpdating) return;
+        const toggle = document.getElementById('voiceResponsesToggle');
+        if (!toggle) return;
+        try {
+            const response = await fetch(this.baseUrl + '/api/voice-responses');
+            if (!response.ok) return;
+            toggle.checked = (await response.json()).enabled;
+            toggle.disabled = false;
+            toggle.onchange = async () => {
+                this._voiceResponsesUpdating = true;
+                toggle.disabled = true;
+                try {
+                    await fetch(this.baseUrl + '/api/voice-responses', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled: toggle.checked })
+                    });
+                } finally {
+                    this._voiceResponsesUpdating = false;
+                    await this.loadVoiceResponses();
+                }
+            };
+        } catch (error) { this.debugLog(error); }
     }
 
     async loadBackgroundEnforcement() {

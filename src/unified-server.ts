@@ -8,7 +8,7 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import { execFile, execFileSync, type ChildProcess } from 'child_process';
+import { spawn, execFile, execFileSync, type ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
@@ -137,6 +137,7 @@ interface Utterance {
   id: string;
   text: string;
   timestamp: Date;
+  source?: 'speech' | 'typed';
   status: 'pending' | 'delivered' | 'responded';
 }
 
@@ -146,6 +147,7 @@ interface ConversationMessage {
   role: 'user' | 'assistant';
   text: string;
   timestamp: Date;
+  source?: 'speech' | 'typed';
   status?: 'pending' | 'delivered' | 'responded'; // Only for user messages
 }
 
@@ -153,11 +155,12 @@ class UtteranceQueue {
   utterances: Utterance[] = [];
   messages: ConversationMessage[] = []; // Full conversation history
 
-  add(text: string, timestamp?: Date): Utterance {
+  add(text: string, timestamp?: Date, source?: 'speech' | 'typed'): Utterance {
     const utterance: Utterance = {
       id: randomUUID(),
       text: text.trim(),
       timestamp: timestamp || new Date(),
+      source,
       status: 'pending'
     };
 
@@ -168,6 +171,7 @@ class UtteranceQueue {
       id: utterance.id,
       role: 'user',
       text: utterance.text,
+      source: utterance.source,
       timestamp: utterance.timestamp,
       status: utterance.status
     });
@@ -250,6 +254,7 @@ const SPEECH_RECOGNIZER_AVAILABLE = !NO_TRANSCRIBE && SpeechRecognizer.binaryExi
 // Voice preferences (controlled by browser)
 let voicePreferences = {
   voiceActive: false,
+  voiceResponses: true,
   selectedVoice: 'browser' as string,  // 'system' or 'browser:N'
   speechRate: 200 as number,  // words per minute for say -o rendering
   feedbackSoundMode: 'continuous' as 'once' | 'continuous' | 'off'
@@ -258,7 +263,7 @@ let voicePreferences = {
 // Render TTS to WAV file using say -o (uncompressed PCM for best quality)
 function renderTtsToFile(text: string, rate: number): Promise<{ filePath: string; audioId: string }> {
   const audioId = randomUUID();
-  const filePath = `/tmp/mcp-voice-hooks-tts-${audioId}.wav`;
+  const filePath = path.join(os.tmpdir(), `mcp-voice-hooks-tts-${audioId}.wav`);
   const clampedRate = Math.max(50, Math.min(500, Math.round(rate)));
 
   return new Promise((resolve, reject) => {
@@ -536,6 +541,8 @@ interface SessionState {
   sessionId: string;
   agentId: string | null;
   agentType: string | null;
+  folderName?: string;
+  firstPrompt?: string;
   queue: UtteranceQueue;
   lastToolUseTimestamp: Date | null;
   lastSpeakTimestamp: Date | null;
@@ -543,11 +550,35 @@ interface SessionState {
 }
 
 const sessions = new Map<string, SessionState>();
-// The server's selected session key — driven by browser selection.
-// Auto-set to the first session that registers (before browser connects),
-// then updated by browser's 'select-session' WS message.
+// 明示操作でのみ選択する。保存された選択はフックで実在を確認して復元する。
 let selectedSessionKey: string | null = null;
 
+const stateFile = process.env.MCP_VOICE_HOOKS_STATE_FILE || path.join(os.homedir(), '.mcp-voice-hooks', 'state.json');
+let preferredSessionKey: string | null = null;
+if (!IS_MCP_MANAGED) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (typeof saved.voiceResponses === 'boolean') voicePreferences.voiceResponses = saved.voiceResponses;
+    if (typeof saved.selectedSessionKey === 'string') preferredSessionKey = saved.selectedSessionKey;
+    if (typeof saved.backgroundVoiceEnforcement === 'boolean') backgroundVoiceEnforcement = saved.backgroundVoiceEnforcement;
+  } catch (error) { debugLog('[State]', error); }
+}
+function persistState(): void {
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  const temporary = stateFile + '.' + process.pid + '.tmp';
+  fs.writeFileSync(temporary, JSON.stringify({ voiceResponses: voicePreferences.voiceResponses,
+    selectedSessionKey: preferredSessionKey, backgroundVoiceEnforcement }));
+  fs.renameSync(temporary, stateFile);
+}
+function selectSession(key: string, persist = true): void {
+  const previousPreferred = preferredSessionKey;
+  preferredSessionKey = key;
+  try { if (persist) persistState(); } catch (error) { preferredSessionKey = previousPreferred; throw error; }
+  if (selectedSessionKey === null) migrateDefaultSession(key, sessions.get(key)!.sessionId);
+  selectedSessionKey = key;
+  for (const client of wsAudioClients) (client as any).selectedSessionKey = key;
+  for (const client of ttsClients.keys()) client.write(`data: ${JSON.stringify({ type: 'session-selected', key })}\n\n`);
+}
 const SESSION_TTL_MS = 120 * 60 * 1000; // 2 hour TTL (kept longer than WAIT_TIMEOUT_SECONDS so a session can't expire mid-wait)
 
 function getOrCreateSession(key: string, sessionId?: string, agentId?: string | null, agentType?: string | null): SessionState {
@@ -647,6 +678,8 @@ function resolveSessionForNewInput(explicitKey: string | undefined | null): Sess
   if (selectedSessionKey && sessions.has(selectedSessionKey)) {
     return sessions.get(selectedSessionKey)!;
   }
+  // 再登録待ちの選択先がある場合、背景セッションにフォールバックしない。
+  if (preferredSessionKey && !selectedSessionKey) return null;
   const realCount = countRealSessions();
   if (realCount === 1) {
     // No ambiguity — single-session backward compat. Deliberately NOT
@@ -665,10 +698,8 @@ function resolveSessionForNewInput(explicitKey: string | undefined | null): Sess
 function cleanupSessions(): void {
   const now = Date.now();
   for (const [key, session] of sessions) {
-    if (now - session.lastActivity.getTime() > SESSION_TTL_MS) {
+    if (key !== selectedSessionKey && now - session.lastActivity.getTime() > SESSION_TTL_MS) {
       sessions.delete(key);
-      const wasActive = key === selectedSessionKey;
-      if (wasActive) selectedSessionKey = null;
       debugLog(`[Session] TTL cleanup: key=${key} lastActivity=${session.lastActivity.toISOString()}`);
     }
   }
@@ -822,12 +853,14 @@ app.post('/api/potential-utterances', (req: Request, res: Response) => {
     return;
   }
   const parsedTimestamp = timestamp ? new Date(timestamp) : undefined;
-  const utterance = session.queue.add(text, parsedTimestamp);
+  if (req.body.source !== undefined && !['speech', 'typed'].includes(req.body.source)) { res.status(400).json({ error: 'Invalid source' }); return; }
+  const utterance = session.queue.add(text, parsedTimestamp, req.body.source);
   res.json({
     success: true,
     utterance: {
       id: utterance.id,
       text: utterance.text,
+      source: utterance.source,
       timestamp: utterance.timestamp,
       status: utterance.status,
     },
@@ -843,6 +876,7 @@ app.get('/api/utterances', (req: Request, res: Response) => {
     utterances: utterances.map(u => ({
       id: u.id,
       text: u.text,
+      source: u.source,
       timestamp: u.timestamp,
       status: u.status,
     })),
@@ -860,6 +894,7 @@ app.get('/api/conversation', (req: Request, res: Response) => {
       id: m.id,
       role: m.role,
       text: m.text,
+      source: m.source,
       timestamp: m.timestamp,
       status: m.status // Only present for user messages
     }))
@@ -897,6 +932,7 @@ function dequeueUtterancesCore(session?: SessionState) {
     success: true,
     utterances: pendingUtterances.map(u => ({
       text: u.text,
+      source: u.source,
       timestamp: u.timestamp,
     })),
   };
@@ -994,6 +1030,7 @@ async function waitForUtteranceCore(session?: SessionState) {
         utterances: sortedUtterances.map(u => ({
           id: u.id,
           text: u.text,
+          source: u.source,
           timestamp: u.timestamp,
           status: 'delivered', // They are now delivered
         })),
@@ -1055,7 +1092,7 @@ app.get('/api/has-pending-utterances', (_req: Request, res: Response) => {
 // Unified action validation endpoint
 app.post('/api/validate-action', (req: Request, res: Response) => {
   const { action } = req.body;
-  const voiceActive = voicePreferences.voiceActive;
+  const wantsVoiceResponses = shouldRequireSpeak();
   const session = getActiveSessionOrFirst();
 
   if (!action || !['tool-use', 'stop'].includes(action)) {
@@ -1077,7 +1114,7 @@ app.post('/api/validate-action', (req: Request, res: Response) => {
   }
 
   // Check for delivered but unresponded utterances (when voice enabled)
-  if (voiceActive) {
+  if (wantsVoiceResponses) {
     const deliveredUtterances = session.queue.utterances.filter(u => u.status === 'delivered');
     if (deliveredUtterances.length > 0) {
       res.json({
@@ -1110,7 +1147,7 @@ app.post('/api/validate-action', (req: Request, res: Response) => {
 // Unified hook handler
 function handleHookRequest(attemptedAction: 'tool' | 'speak' | 'stop' | 'post-tool', session?: SessionState): { decision: 'approve' | 'block', reason?: string } | Promise<{ decision: 'approve' | 'block', reason?: string }> {
   const s = session || getActiveSessionOrFirst();
-  const voiceActive = voicePreferences.voiceActive;
+  const wantsVoiceResponses = shouldRequireSpeak();
 
   // 1. Check for pending utterances and auto-dequeue
   // Always check for pending utterances regardless of voiceActive
@@ -1132,7 +1169,7 @@ function handleHookRequest(attemptedAction: 'tool' | 'speak' | 'stop' | 'post-to
   }
 
   // 2. Check for delivered utterances (when voice enabled)
-  if (voiceActive) {
+  if (wantsVoiceResponses) {
     const deliveredUtterances = s.queue.utterances.filter(u => u.status === 'delivered');
     if (deliveredUtterances.length > 0) {
       // Only allow speak to proceed
@@ -1160,7 +1197,7 @@ function handleHookRequest(attemptedAction: 'tool' | 'speak' | 'stop' | 'post-to
   // 5. Handle stop
   if (attemptedAction === 'stop') {
     // Check if must speak after tool use
-    if (voiceActive && s.lastToolUseTimestamp &&
+    if (wantsVoiceResponses && s.lastToolUseTimestamp &&
       (!s.lastSpeakTimestamp || s.lastSpeakTimestamp < s.lastToolUseTimestamp)) {
       return {
         decision: 'block',
@@ -1168,8 +1205,8 @@ function handleHookRequest(attemptedAction: 'tool' | 'speak' | 'stop' | 'post-to
       };
     }
 
-    // Auto-wait for utterances (only if voice is active)
-    if (voiceActive) {
+    // マイク待機は独立した状態で判断する。
+    if (voicePreferences.voiceActive) {
       return (async () => {
         try {
           debugLog(`[Stop Hook] Auto-calling wait_for_utterance...`);
@@ -1225,6 +1262,8 @@ function parseHookRequest(req: Request): { key: string; sessionId: string; agent
   const agentType = req.body?.agent_type || null;
   const key = compositeKey(sessionId, agentId);
   const session = getOrCreateSession(key, sessionId, agentId, agentType);
+  if (typeof req.body?.cwd === 'string') session.folderName = req.body.cwd.split(/[\\/]/).filter(Boolean).pop();
+  if (selectedSessionKey === null && key === preferredSessionKey) selectSession(key, false);
   return { key, sessionId, agentId, session };
 }
 
@@ -1280,7 +1319,7 @@ app.post('/api/hooks/stop', async (req: Request, res: Response) => {
 
   // Background session (not browser-selected): enforce "must speak after tool use" only when background enforcement is enabled
   if (!isSelectedKey(key)) {
-    const enforceSpeak = backgroundVoiceEnforcement;
+    const enforceSpeak = backgroundVoiceEnforcement && shouldRequireSpeak();
     if (enforceSpeak && session.lastToolUseTimestamp &&
       (!session.lastSpeakTimestamp || session.lastSpeakTimestamp < session.lastToolUseTimestamp)) {
       res.json({
@@ -1394,24 +1433,17 @@ function isVoiceStartCommand(promptText: string): boolean {
 // sessions to call speak(), which would let them claim it the same way).
 app.post('/api/hooks/user-prompt', (req: Request, res: Response) => {
   logHookRequest(req, 'user-prompt');
-  const { key, sessionId } = parseHookRequest(req);
+  const { key, session } = parseHookRequest(req);
   // The exact field name for this in the official Claude Code hooks docs
   // (https://code.claude.com/docs/en/hooks) has been reported inconsistently
   // across sources during development — accept both `prompt_text` and `prompt`
   // so this trigger doesn't silently stop firing if either turns out to be wrong.
   const promptText: string = req.body?.prompt_text || req.body?.prompt || '';
 
-  if (selectedSessionKey === null && isVoiceStartCommand(promptText)) {
-    // If the browser sent something (typed text, or a recognized utterance)
-    // before any real session had registered, resolveSessionForNewInput()
-    // would have bucketed it into the anonymous 'default' session (the only
-    // safe choice at the time — no real session existed yet to attribute it
-    // to). Now that a real session is being explicitly selected, bring that
-    // input along so it isn't silently stranded and never reaches Claude.
-    migrateDefaultSession(key, sessionId);
-    selectedSessionKey = key;
-    debugLog(`[Session] Auto-selected via UserPromptSubmit trigger phrase: ${key}`);
+  if (!session.firstPrompt && typeof promptText === 'string' && promptText.trim() && !isVoiceStartCommand(promptText)) {
+    session.firstPrompt = Array.from(promptText.trim().replace(/\s+/g, ' ')).slice(0, 40).join('');
   }
+  if (isVoiceStartCommand(promptText)) selectSession(key);
 
   res.json({});
 });
@@ -1795,7 +1827,7 @@ function startRecognizerForClient(client: WsAudioClient): void {
         debugLog(`[SpeechRecognizer] Dropped transcript, no session selected with multiple sessions active: "${result.text.trim()}"`);
         return;
       }
-      session.queue.add(result.text.trim());
+      session.queue.add(result.text.trim(), undefined, 'speech');
 
       client.ws.send(JSON.stringify({
         type: 'transcript-final',
@@ -1951,12 +1983,22 @@ function attachWsUpgrade(server: http.Server | https.Server) {
 // Helper function to format voice utterances for display
 function formatVoiceUtterances(utterances: any[]): string {
   const utteranceTexts = utterances
-    .map(u => `"${u.text}"`)
+    .map(u => `${u.source === "typed" ? "typed input" : "voice input"}: "${u.text}"`)
     .join('\n');
 
-  return `Assistant received voice input from the user (${utterances.length} utterance${utterances.length !== 1 ? 's' : ''}):\n\n${utteranceTexts}${getVoiceResponseReminder()}`;
+  return `Assistant received input from the user (${utterances.length} utterance${utterances.length !== 1 ? 's' : ''}):\n\n${utteranceTexts}${getVoiceResponseReminder()}`;
 }
 
+app.get('/api/voice-responses', (_req, res) => res.json({ enabled: voicePreferences.voiceResponses }));
+app.post('/api/voice-responses', (req, res) => {
+  if (typeof req.body.enabled !== 'boolean') { res.status(400).json({ error: 'enabled must be boolean' }); return; }
+  const previous = voicePreferences.voiceResponses;
+  voicePreferences.voiceResponses = req.body.enabled;
+  try { persistState(); } catch (error) { voicePreferences.voiceResponses = previous; throw error; }
+  for (const client of ttsClients.keys()) client.write('data: {"type":"voice-preferences"}\n\n');
+  res.json({ enabled: voicePreferences.voiceResponses });
+});
+app.get('/api/health', (_req, res) => res.json({ service: 'mcp-voice-hooks', pid: process.pid }));
 // API for voice active state
 app.post('/api/voice-active', (req: Request, res: Response) => {
   const { active } = req.body;
@@ -1982,7 +2024,9 @@ app.get('/api/speech-recognition-available', (_req: Request, res: Response) => {
 // API for background voice enforcement
 app.post('/api/background-voice-enforcement', (req: Request, res: Response) => {
   const { enabled } = req.body;
+  const previous = backgroundVoiceEnforcement;
   backgroundVoiceEnforcement = !!enabled;
+  try { persistState(); } catch (error) { backgroundVoiceEnforcement = previous; throw error; }
   debugLog(`[Background Voice Enforcement] ${backgroundVoiceEnforcement ? 'Enabled' : 'Disabled'}`);
   res.json({ success: true, enabled: backgroundVoiceEnforcement });
 });
@@ -1996,6 +2040,7 @@ app.get('/api/sessions', (_req: Request, res: Response) => {
   const sessionList = Array.from(sessions.values()).map(s => ({
     key: s.key,
     sessionId: s.sessionId,
+    displayName: [s.firstPrompt, s.folderName].filter(Boolean).join(' — ') || undefined,
     agentId: s.agentId,
     agentType: s.agentType,
     isActive: s.key === selectedSessionKey,
@@ -2054,16 +2099,7 @@ app.post('/api/active-session', (req: Request, res: Response) => {
     getOrCreateSession(key, sessionIdFromKey, agentIdFromKey === 'main' ? null : agentIdFromKey, null);
   }
 
-  const previousKey = selectedSessionKey;
-  if (previousKey === null) {
-    // See the identical migration in the UserPromptSubmit auto-select handler —
-    // input sent before any real session existed lands in the anonymous
-    // 'default' session; bring it along now that a real one is being selected.
-    const [migratedSessionId] = JSON.parse(key) as [string, string];
-    migrateDefaultSession(key, migratedSessionId);
-  }
-  selectedSessionKey = key;
-  debugLog(`[Session] Selected changed: ${previousKey} → ${key}`);
+  selectSession(key);
 
   res.json({
     success: true,
@@ -2081,12 +2117,17 @@ app.post('/api/speak', async (req: Request, res: Response) => {
   }
 
   // Check if voice responses are enabled
-  if (!voicePreferences.voiceActive) {
+  if (!voicePreferences.voiceResponses) {
     debugLog(`[Speak] Voice responses disabled, returning error`);
     res.status(400).json({
       error: 'Voice responses are disabled',
       message: 'Cannot speak when voice responses are disabled'
     });
+    return;
+  }
+
+  if (!shouldRequireSpeak()) {
+    res.status(503).json({ error: 'No voice browser is connected. Audio cannot be played; please respond in text.' });
     return;
   }
 
@@ -2278,30 +2319,57 @@ app.get('/messenger', (_req: Request, res: Response) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
+const daemonHost = BIND_HOST === '0.0.0.0' ? '127.0.0.1' : BIND_HOST.includes(':') ? `[${BIND_HOST}]` : BIND_HOST;
+const daemonUrl = `http://${daemonHost}:${HTTP_PORT}`;
+async function daemonAlive(): Promise<boolean> {
+  let response: globalThis.Response;
+  try {
+    response = await fetch(daemonUrl + '/api/health', { signal: AbortSignal.timeout(700) });
+  } catch { return false; }
+  try {
+    if (response.ok && (await response.json() as any).service === 'mcp-voice-hooks') return true;
+  } catch { /* HTTP response without our identity means the port is occupied. */ }
+  throw new Error('Port is occupied by a legacy server or another application; daemon launch skipped.');
+}
+let daemonStarting: Promise<void> | null = null;
+async function ensureDaemon(): Promise<void> {
+  if (daemonStarting) return daemonStarting;
+  daemonStarting = (async () => {
+    if (await daemonAlive()) return;
+    const daemonFlags = process.argv.slice(2).filter(arg => ['--debug', '-d', '--no-transcribe'].includes(arg));
+    const child = spawn(process.execPath, [__filename, '--daemon', ...daemonFlags], {
+      detached: true, windowsHide: true, stdio: 'ignore', env: process.env,
+    });
+    child.on('error', error => debugLog('[Daemon]', error));
+    child.unref();
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (await daemonAlive()) return;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error('Daemon startup timed out');
+  })();
+  try { await daemonStarting; } finally { daemonStarting = null; }
+}
 // Start HTTP server with EADDRINUSE handling for multi-session support
 // Create server and attach error handler BEFORE listen to ensure proper event ordering
-let eaddrinuseDetected = false;
+
 const httpServer = http.createServer(app);
 
 // Attach WebSocket upgrade handler to HTTP server
 attachWsUpgrade(httpServer);
 
-// Handle EADDRINUSE: another instance already owns the HTTP server.
-// This process will run as MCP shim only, proxying speak calls to the existing server.
+// 同時起動でポート取得に負けたdaemonは静かに終了する。
 httpServer.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {
-    eaddrinuseDetected = true;
-    const log = IS_MCP_MANAGED ? console.error : console.log;
-    log(`[HTTP] Port ${HTTP_PORT} already in use — another instance owns the HTTP server`);
-    log(`[HTTP] Running as MCP shim only, proxying to http://localhost:${HTTP_PORT}`);
+    process.exit(0);
   } else {
     // Re-throw unexpected errors
     throw err;
   }
 });
 
-httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
-  if (eaddrinuseDetected) return; // defensive guard
+if (!IS_MCP_MANAGED) httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
+
 
   if (!BIND_IS_LOOPBACK) {
     const log = IS_MCP_MANAGED ? console.error : console.log;
@@ -2310,10 +2378,10 @@ httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
 
   // Pre-render sound effects (chime, pulses) for server-side audio
   try {
-    await generateSounds();
-    fs.appendFileSync('/tmp/mcp-voice-hooks.log', `  [Sounds] Generated: chime=${sounds.chime} listening=${sounds.listeningPulse} processing=${sounds.processingPulse}\n`);
+    if (IS_MACOS) await generateSounds();
+    debugLog(`  [Sounds] Generated: chime=${sounds.chime} listening=${sounds.listeningPulse} processing=${sounds.processingPulse}\n`);
   } catch (e) {
-    fs.appendFileSync('/tmp/mcp-voice-hooks.log', `  [Sounds] FAILED: ${e}\n`);
+    debugLog(`  [Sounds] FAILED: ${e}\n`);
   }
 
   // Log startup info with git hash and timestamp to file for debugging
@@ -2321,7 +2389,7 @@ httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
   let gitHash = 'unknown';
   try { gitHash = execSync('git rev-parse --short HEAD', { cwd: import.meta.dirname, encoding: 'utf-8' }).trim(); } catch {}
   const startupLine = `[${new Date().toISOString()}] mcp-voice-hooks started: git=${gitHash} port=${HTTP_PORT} mode=${IS_MCP_MANAGED ? 'mcp' : 'standalone'} features=[subagent-detection]`;
-  try { const fs = await import('fs'); fs.appendFileSync('/tmp/mcp-voice-hooks.log', startupLine + '\n'); } catch {}
+  debugLog(startupLine);
 
   if (!IS_MCP_MANAGED) {
     console.log(`[HTTP] Server listening on http://localhost:${HTTP_PORT}`);
@@ -2335,7 +2403,7 @@ httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
   // Auto-open browser if no frontend connects within 3 seconds
   // Skip for secondary instances that detected EADDRINUSE
   const autoOpenBrowser = process.env.MCP_VOICE_HOOKS_AUTO_OPEN_BROWSER !== 'false'; // Default to true
-  if (IS_MCP_MANAGED && autoOpenBrowser) {
+  if (process.argv.includes('--daemon') && autoOpenBrowser) {
     setTimeout(async () => {
       if (ttsClients.size === 0 && wsAudioClients.size === 0) {
         debugLog('[Browser] No frontend connected, opening browser...');
@@ -2353,7 +2421,7 @@ httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
   }
 
   // Start HTTPS server in same process, sharing state with HTTP server
-  startHttpsServer();
+  if (process.env.MCP_VOICE_HOOKS_DISABLE_HTTPS !== 'true') startHttpsServer();
 });
 
 // HTTPS server setup — only called from HTTP listen callback to ensure
@@ -2423,17 +2491,25 @@ function startHttpsServer() {
   }
 }
 
+// Browser SSE and open audio WebSockets can receive playback.
+function shouldRequireSpeak(): boolean {
+  return voicePreferences.voiceResponses && (ttsClients.size > 0 ||
+    Array.from(wsAudioClients).some(client => client.ws.readyState === WebSocket.OPEN));
+}
+
 // Helper function to get voice response reminder
 function getVoiceResponseReminder(): string {
-  const voiceActive = voicePreferences.voiceActive;
-  return voiceActive
-    ? '\n\nThe user has enabled voice responses, so use the \'speak\' tool to respond to the user\'s voice input before proceeding.'
+  return shouldRequireSpeak()
+    ? '\n\nThe user has enabled voice responses, so use the \'speak\' tool to respond to the user\'s input before proceeding.'
     : '';
 }
 
 // MCP Server Setup (only if MCP-managed)
 if (IS_MCP_MANAGED) {
   // Use stderr in MCP mode to avoid interfering with protocol
+  const maintainDaemon = () => ensureDaemon().catch(error => console.error('[Daemon]', String(error)));
+  await maintainDaemon();
+  setInterval(() => { void maintainDaemon(); }, 30_000).unref();
   console.error('[MCP] Initializing MCP server...');
 
   const mcpServer = new Server(
@@ -2495,12 +2571,15 @@ if (IS_MCP_MANAGED) {
           };
         }
 
-        const response = await fetch(`http://localhost:${HTTP_PORT}/api/speak`, {
+        const send = () => fetch(daemonUrl + '/api/speak', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text, voiceToken }),
         });
 
+        let response: globalThis.Response;
+        try { response = await send(); }
+        catch { await ensureDaemon(); response = await send(); }
         const data = await response.json() as any;
 
         if (response.ok) {
@@ -2541,7 +2620,9 @@ if (IS_MCP_MANAGED) {
 
   // Connect via stdio
   const transport = new StdioServerTransport();
-  mcpServer.connect(transport);
+  await mcpServer.connect(transport);
+  // 転送役だけを終了する。detachedのdaemonには終了シグナルを送らない。
+  mcpServer.onclose = () => process.exit(0);
   // Use stderr in MCP mode to avoid interfering with protocol
   console.error('[MCP] Server connected via stdio');
 } else {
