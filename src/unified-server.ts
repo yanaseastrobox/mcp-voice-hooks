@@ -1403,7 +1403,7 @@ app.post('/api/hooks/post-tool', (req: Request, res: Response) => {
 // Phrases that explicitly ask to start a voice conversation. Kept as a small,
 // literal allowlist rather than fuzzy/LLM-based intent detection — a false
 // positive here would auto-select a session the user didn't actually intend.
-const VOICE_START_PHRASES = ['会話開始'];
+const VOICE_START_PHRASES = ['会話開始', '音声会話開始', '音声対話開始', '音声開始'];
 // Allowed trailing politeness/particles. isVoiceStartCommand() requires the
 // ENTIRE trimmed message to be exactly phrase+suffix — nothing else — rather
 // than matching the phrase as a substring anywhere in a longer sentence.
@@ -1438,7 +1438,10 @@ app.post('/api/hooks/user-prompt', (req: Request, res: Response) => {
   // (https://code.claude.com/docs/en/hooks) has been reported inconsistently
   // across sources during development — accept both `prompt_text` and `prompt`
   // so this trigger doesn't silently stop firing if either turns out to be wrong.
-  const promptText: string = req.body?.prompt_text || req.body?.prompt || '';
+  // The desktop app can prepend <system-reminder> blocks to the user's prompt;
+  // strip them so the trigger phrase and the display name see only what was typed.
+  const promptText: string = String(req.body?.prompt_text || req.body?.prompt || '')
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 
   if (!session.firstPrompt && typeof promptText === 'string' && promptText.trim() && !isVoiceStartCommand(promptText)) {
     session.firstPrompt = Array.from(promptText.trim().replace(/\s+/g, ' ')).slice(0, 40).join('');
