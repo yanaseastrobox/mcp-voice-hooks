@@ -2424,16 +2424,31 @@ if (!IS_MCP_MANAGED) httpServer.listen(HTTP_PORT, BIND_HOST, async () => {
       if (ttsClients.size === 0 && wsAudioClients.size === 0) {
         debugLog('[Browser] No frontend connected, opening browser...');
         try {
-          const open = (await import('open')).default;
-          // Open default UI (messenger is now at root)
-          await open(`http://localhost:${HTTP_PORT}`);
+          const { default: open, apps } = await import('open');
+          const url = `http://localhost:${HTTP_PORT}`;
+          // Speech recognition needs Chrome (it does not work in Brave, for
+          // example), so prefer Chrome over the OS default browser.
+          // MCP_VOICE_HOOKS_BROWSER=default restores the old behavior.
+          let opened = false;
+          if (process.env.MCP_VOICE_HOOKS_BROWSER !== 'default') {
+            try {
+              const child = await open(url, { app: { name: apps.chrome } });
+              opened = await new Promise<boolean>(resolve => {
+                child.once('error', () => resolve(false));
+                child.once('spawn', () => resolve(true));
+              });
+            } catch (error) {
+              debugLog('[Browser] Chrome not available, falling back to default browser:', error);
+            }
+          }
+          if (!opened) await open(url);
         } catch (error) {
           debugLog('[Browser] Failed to open browser:', error);
         }
       } else {
         debugLog(`[Browser] Frontend already connected (${ttsClients.size} SSE + ${wsAudioClients.size} WS client(s))`)
       }
-    }, 3000);
+    }, 8000); // long enough for an already-open tab to reconnect after a daemon restart, so no duplicate tab is opened
   }
 
   // Start HTTPS server in same process, sharing state with HTTP server
