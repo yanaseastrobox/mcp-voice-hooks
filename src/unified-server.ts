@@ -1453,9 +1453,11 @@ app.post('/api/hooks/user-prompt', (req: Request, res: Response) => {
   // across sources during development — accept both `prompt_text` and `prompt`
   // so this trigger doesn't silently stop firing if either turns out to be wrong.
   // The desktop app can prepend <system-reminder> blocks to the user's prompt;
-  // strip them so the trigger phrase and the display name see only what was typed.
+  // strip only those leading blocks so the trigger phrase and the display name
+  // see what was typed. Blocks in the middle stay, so removing one can never
+  // join two fragments into a trigger phrase.
   const promptText: string = String(req.body?.prompt_text || req.body?.prompt || '')
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+    .replace(/^(?:\s*<system-reminder>[\s\S]*?<\/system-reminder>)+/, '').trim();
 
   if (!session.firstPrompt && typeof promptText === 'string' && promptText.trim() && !isVoiceStartCommand(promptText)) {
     session.firstPrompt = Array.from(promptText.trim().replace(/\s+/g, ' ')).slice(0, 40).join('');
@@ -2531,10 +2533,12 @@ function startHttpsServer() {
   }
 }
 
-// Browser SSE and open audio WebSockets can receive playback.
+// Playback needs a path that actually carries audio: the SSE stream drives the
+// browser's own speech everywhere, while the audio WebSocket only carries the
+// macOS `say` rendering. Off macOS an open WebSocket alone cannot play anything.
 function shouldRequireSpeak(): boolean {
-  return voicePreferences.voiceResponses && (ttsClients.size > 0 ||
-    Array.from(wsAudioClients).some(client => client.ws.readyState === WebSocket.OPEN));
+  return voicePreferences.voiceResponses && (ttsClients.size > 0 || (IS_MACOS &&
+    Array.from(wsAudioClients).some(client => client.ws.readyState === WebSocket.OPEN)));
 }
 
 // Helper function to get voice response reminder
@@ -2663,6 +2667,9 @@ if (IS_MCP_MANAGED) {
   await mcpServer.connect(transport);
   // 転送役だけを終了する。detachedのdaemonには終了シグナルを送らない。
   mcpServer.onclose = () => process.exit(0);
+  // SDKのstdio transportはstdinの終了を通知しない。親がstdinを閉じただけでも残留しないようにする。
+  process.stdin.once('end', () => process.exit(0));
+  process.stdin.once('close', () => process.exit(0));
   // Use stderr in MCP mode to avoid interfering with protocol
   console.error('[MCP] Server connected via stdio');
 } else {

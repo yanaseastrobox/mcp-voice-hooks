@@ -89,6 +89,13 @@ try {
   await api('/api/hooks/post-tool', { session_id: 'C' });
   await api('/api/hooks/user-prompt', { session_id: 'C', prompt: '背景作業' });
   assert.equal((await api('/api/sessions')).activeKey, key('B'));
+  // 途中のsystem-reminderを消して合言葉が成立してはならない。先頭のものだけ除く。
+  await api('/api/hooks/user-prompt', { session_id: 'C', prompt: '音声<system-reminder>x</system-reminder>開始' });
+  assert.equal((await api('/api/sessions')).activeKey, key('B'));
+  await api('/api/hooks/user-prompt', { session_id: 'A', prompt: '<system-reminder>x</system-reminder>\n<system-reminder>y</system-reminder>\n音声会話開始' });
+  assert.equal((await api('/api/sessions')).activeKey, key('A'));
+  await api('/api/hooks/user-prompt', { session_id: 'B', prompt: '会話開始' });
+  assert.equal((await api('/api/sessions')).activeKey, key('B'));
   assert.equal((await api('/api/sessions')).sessions.find(s => s.key === key('B')).displayName, '案件B');
   console.log('PASS: 明示会話開始でA→B、背景フックでは変更なし、表示名');
   const playback = new AbortController();
@@ -156,8 +163,11 @@ try {
     assert.match(output, /"speak"/);
     assert.match(errors, /legacy server.*daemon launch skipped/);
     assert.equal(forwarder.exitCode, null);
-    await stop(forwarder);
-    console.log('PASS: 旧版ポート占有時もMCPのspeakツールを維持');
+    // killせずstdinを閉じるだけで、転送役が自分で終了すること。
+    const exited = once(forwarder, 'exit');
+    forwarder.stdin.end();
+    await Promise.race([exited, delay(5000).then(() => { throw Error('stdin終了後も転送役が残留'); })]);
+    console.log('PASS: 旧版ポート占有時もMCPのspeakツールを維持、stdin終了で転送役が終了');
   } finally { await new Promise(resolve => legacy.close(resolve)); }
 } finally {
   for (const child of children) await stop(child);
