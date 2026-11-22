@@ -512,6 +512,17 @@
             margin-top: 4px;
         }
 
+        /* 運転モード */
+        .car-mode-status {
+            padding: 6px 12px;
+            font-size: 13px;
+            background: #FFF4D6;
+            color: #6B4E00;
+            border-top: 1px solid #F0DFA8;
+        }
+        .car-mode-status.ignored { background: #EEE; color: #666; border-top-color: #DDD; }
+        .car-mode-status.open { background: #DFF5E1; color: #1E6B2A; border-top-color: #B5E2BB; }
+
         .system-voice-info,
         .rate-warning {
             padding: 8px 12px;
@@ -873,6 +884,17 @@
                                 <option value="off">Off</option>
                             </select>
                         </div>
+                        <div class="tts-control">
+                            <label for="voiceSelect">読み上げの声:</label>
+                            <select id="voiceSelect"><option value="">自動</option></select>
+                        </div>
+                        <div class="tts-control">
+                            <label><input type="checkbox" id="carModeToggle"> 運転モード（呼びかけた時だけ聞く）</label>
+                        </div>
+                        <div class="tts-control">
+                            <label for="wakeWordsInput">呼びかけの言葉（カンマ区切り）:</label>
+                            <input type="text" id="wakeWordsInput">
+                        </div>
                         <button class="tts-test-btn" id="testTTSBtn">Test Voice</button>
                     </div>
                 </div>
@@ -923,6 +945,7 @@
 
             <!-- Input Section -->
             <div class="input-section">
+                <div id="carModeStatus" class="car-mode-status" style="display: none;"></div>
                 <!-- Text Input with Microphone -->
                 <div class="input-container">
                     <textarea

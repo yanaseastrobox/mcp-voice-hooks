@@ -134,6 +134,10 @@ class MessengerClient {
         this.speechRateInput = document.getElementById('speechRateInput');
         this.feedbackSoundModeSelect = document.getElementById('feedbackSoundMode');
         this.testTTSBtn = document.getElementById('testTTSBtn');
+        this.voiceSelect = document.getElementById('voiceSelect');
+        this.carModeToggle = document.getElementById('carModeToggle');
+        this.wakeWordsInput = document.getElementById('wakeWordsInput');
+        this.carModeStatus = document.getElementById('carModeStatus');
 
         // Session sidebar elements
         this.sessionSidebar = document.getElementById('sessionSidebar');
@@ -684,13 +688,169 @@ class MessengerClient {
                     await fetch(`${this.baseUrl}/api/test-voice`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ text: 'This is Voice Mode for Claude Code. How can I help you today?' })
+                        body: JSON.stringify({ text: '読み上げの声のテストです。この声でよろしいですか。' })
                     });
                 } catch (error) {
                     console.error('Failed to test voice:', error);
                 }
             });
         }
+
+        this.setupVoiceAndCarMode();
+    }
+
+    // ---- 読み上げの声の選択 / 運転モード（呼びかけた時だけ聞く） ----
+
+    setupVoiceAndCarMode() {
+        const read = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+        this._store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode etc. */ } };
+
+        this.selectedVoiceName = read('ttsVoiceName') || '';
+        this.carMode = read('carMode') === 'true';
+        this.wakeWordsText = read('carWakeWords') || 'クロード,くろーど,Claude,黒土';
+        this.carFollowupMs = 10000; // 呼びかけ・読み上げ終了後、この間は呼びかけ無しで続けて話せる
+        this._carFollowupUntil = 0;
+        this._buildWakeRegex();
+
+        if (this.voiceSelect) {
+            this._populateVoiceSelect();
+            if (window.speechSynthesis) {
+                window.speechSynthesis.addEventListener('voiceschanged', () => this._populateVoiceSelect());
+            }
+            this.voiceSelect.addEventListener('change', (e) => {
+                this.selectedVoiceName = e.target.value;
+                this._voiceFailedName = null; // 選び直したらもう一度試す
+                this._store('ttsVoiceName', this.selectedVoiceName);
+            });
+        }
+        if (this.carModeToggle) {
+            this.carModeToggle.checked = this.carMode;
+            this.carModeToggle.addEventListener('change', (e) => {
+                this.carMode = e.target.checked;
+                this._store('carMode', String(this.carMode));
+                this._carFollowupUntil = 0;
+                this._carSpeechInWindowAt = 0;
+                this._renderCarStatus();
+            });
+        }
+        if (this.wakeWordsInput) {
+            this.wakeWordsInput.value = this.wakeWordsText;
+            this.wakeWordsInput.addEventListener('change', (e) => {
+                this.wakeWordsText = e.target.value;
+                this._store('carWakeWords', this.wakeWordsText);
+                this._buildWakeRegex();
+                this._renderCarStatus();
+            });
+        }
+        this._renderCarStatus();
+    }
+
+    _populateVoiceSelect() {
+        if (!this.voiceSelect || !window.speechSynthesis) return;
+        const voices = window.speechSynthesis.getVoices().filter((v) => v.lang && v.lang.startsWith('ja'));
+        const current = this.selectedVoiceName;
+        this.voiceSelect.innerHTML = '';
+        const auto = document.createElement('option');
+        auto.value = '';
+        auto.textContent = '自動';
+        this.voiceSelect.appendChild(auto);
+        for (const v of voices) {
+            const opt = document.createElement('option');
+            opt.value = v.name;
+            opt.textContent = v.localService ? v.name : `${v.name}（ネット経由）`;
+            this.voiceSelect.appendChild(opt);
+        }
+        // 保存した声がまだ一覧に出ていない（読み込み途中・別ブラウザ）ときも選択は消さない
+        if (current && !voices.some((v) => v.name === current)) {
+            const opt = document.createElement('option');
+            opt.value = current;
+            opt.textContent = `${current}（このブラウザに無い）`;
+            this.voiceSelect.appendChild(opt);
+        }
+        this.voiceSelect.value = current;
+    }
+
+    _buildWakeRegex() {
+        const words = String(this.wakeWordsText || '')
+            .split(/[,、，]/).map((w) => w.trim()).filter(Boolean)
+            .sort((a, b) => b.length - a.length)
+            .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        this._wakeRegex = words.length
+            ? new RegExp(`^[\\s、。,.!！?？]*(?:(?:ねえ|ねぇ|ねー|おい|へい|ヘイ|hey|ok|オッケー)[\\s、。,.!！?？]*)?(?:${words.join('|')})(?:さん|くん)?[\\s、。,.!！?？]*`, 'i')
+            : null;
+    }
+
+    // ナビ・ETC・車内アナウンスでよく出る言い回し。呼びかけの無い発話だけに当てる
+    static CAR_ANNOUNCE_RE = /ETC|イーティーシー|カードが(挿入|抜|確認|読み)|料金は|有効期限|(メートル|キロ|km|ｍ)\s*(先|さき)|この先|その先|(右|左)方向|斜め(右|左)|交差点|(右|左)折|目的地|ルート|案内を(開始|終了)|高速道路|インターチェンジ|ジャンクション|出口|入口|車線|合流|渋滞|一般道|料金所|道なり|しばらく道|オービス|速度(注意|制限)|踏切|分岐|到着(しました|です)|まもなく|サービスエリア|パーキングエリア|トンネル|シートベルト/;
+
+    /**
+     * 運転モードの判定。状態は「呼びかけ待ち」と「受付中（_carFollowupUntil まで）」の2つだけ。
+     * 受付が開くのは ①呼びかけ ②Claudeの読み上げが実際に鳴って正常に終わった時 だけで、
+     * 受け付けた発話そのものでは延長しない（ナビの声で受付が延び続けないように）。
+     * 呼びかけ付きの発話は内容を問わず通す。呼びかけ無しは受付中でもナビ等の言い回しなら捨てる。
+     * 送ってよければその文（呼びかけを除いたもの）、聞き流すなら null を返す。
+     */
+    _applyCarModeFilter(text) {
+        if (!this.carMode) return text;
+        const now = Date.now();
+        if (this._wakeRegex && this._wakeRegex.test(text)) {
+            const rest = text.replace(this._wakeRegex, '').trim();
+            this._carFollowupUntil = now + this.carFollowupMs;
+            this._carSpeechInWindowAt = 0;
+            this._renderCarStatus(rest ? '受け付けました' : null);
+            return rest || null;
+        }
+        // 受付中に話し始めていれば、確定が期限を少し過ぎても受け付ける（長い発話・確定の遅れ）
+        const open = now < this._carFollowupUntil
+            || (this._carSpeechInWindowAt && now - this._carSpeechInWindowAt < 15000);
+        this._carSpeechInWindowAt = 0;
+        if (MessengerClient.CAR_ANNOUNCE_RE.test(text)) {
+            this._renderCarStatus(`聞き流し（ナビ等）：${text.slice(0, 40)}`, true);
+            return null;
+        }
+        if (open) {
+            this._renderCarStatus('受け付けました');
+            return text;
+        }
+        this._renderCarStatus(`聞き流し（呼びかけ無し）：${text.slice(0, 40)}`, true);
+        return null;
+    }
+
+    /** 受付中に話し始めたことを覚えておく（途中経過の認識結果が来た時に呼ぶ） */
+    _noteCarInterim() {
+        if (this.carMode && !this._carSpeechInWindowAt && Date.now() < this._carFollowupUntil) {
+            this._carSpeechInWindowAt = Date.now();
+        }
+    }
+
+    /** Claudeの読み上げが実際に鳴って正常に終わった直後は、呼びかけ無しで返事できる */
+    _openCarFollowupWindow() {
+        if (!this.carMode) return;
+        this._carFollowupUntil = Date.now() + this.carFollowupMs;
+        this._carSpeechInWindowAt = 0;
+        this._renderCarStatus();
+    }
+
+    /** 表示は状態（受付期限）から作る。note は一時的な一言で、数秒後に状態の表示へ戻る */
+    _renderCarStatus(note, ignored = false) {
+        const el = this.carModeStatus;
+        if (!el) return;
+        clearTimeout(this._carStatusTimer);
+        if (!this.carMode) {
+            el.style.display = 'none';
+            return;
+        }
+        const remain = this._carFollowupUntil - Date.now();
+        const open = remain > 0;
+        const firstWord = String(this.wakeWordsText || '').split(/[,、，]/)[0].trim() || '（未設定）';
+        const stateText = open
+            ? 'どうぞ（いまは呼びかけ無しで話せます）'
+            : `運転モード：「${firstWord}」と呼びかけてから話してください`;
+        el.style.display = 'block';
+        el.className = 'car-mode-status' + (note && ignored ? ' ignored' : open ? ' open' : '');
+        el.textContent = note || stateText;
+        const next = note ? 4000 : open ? remain + 50 : 0;
+        if (next) this._carStatusTimer = setTimeout(() => this._renderCarStatus(), next);
     }
 
     async loadData() {
@@ -1038,24 +1198,29 @@ class MessengerClient {
             // 400 "Text is required"; several finals in one event also posted twice.
             let interimTranscript = '';
             let finalTranscript = '';
+            let sawFinal = false;
 
             for (let i = event.resultIndex; i < event.results.length; i++) {
                 const transcript = event.results[i][0].transcript;
 
                 if (event.results[i].isFinal) {
-                    finalTranscript += transcript;
+                    // 運転モードの判定は確定結果ひとつずつ（ナビの声と自分の声が同じイベントに入っても混ぜない）
+                    const accepted = this._applyCarModeFilter(transcript.trim());
+                    if (accepted) finalTranscript += (finalTranscript ? ' ' : '') + accepted;
+                    sawFinal = true;
                 } else {
                     interimTranscript += transcript;
                 }
             }
 
-            if (finalTranscript.trim()) {
+            if (sawFinal) {
                 this.isInterimText = false;
-                this.sendMessage(finalTranscript.trim(), 'speech');
+                if (finalTranscript.trim()) this.sendMessage(finalTranscript.trim(), 'speech');
                 this.messageInput.value = '';
             }
 
             if (interimTranscript) {
+                this._noteCarInterim();
                 this.messageInput.value = interimTranscript;
                 this.isInterimText = true;
                 this.autoGrowTextarea();
@@ -1106,6 +1271,7 @@ class MessengerClient {
 
         this.recognition.onend = () => {
             this._recognitionState = 'idle';
+            this._carSpeechInWindowAt = 0; // 確定しないまま終わった発話の「話し始め」を次へ持ち越さない
             this._cancelRecognitionStopFallback();
             this.debugLog('[VoiceDiag] recognition.onend isListening=%s ttsSpeaking=%s useServerRecognition=%s attempts=%s', this.isListening, this._ttsSpeaking, this.useServerRecognition, this._recognitionRestartAttempts);
             clearTimeout(this._recognitionSettleTimer); // ending (outside a deliberate stop) means it didn't settle either
@@ -1405,7 +1571,10 @@ class MessengerClient {
         utterance.rate = Math.min(10, Math.max(0.1, this.speechRate || 1.0));
         utterance.pitch = 1.0;
         const voices = window.speechSynthesis.getVoices();
-        const jaVoices = voices.filter((v) => v.lang && v.lang.startsWith('ja'));
+        const allJaVoices = voices.filter((v) => v.lang && v.lang.startsWith('ja'));
+        // 選んだのに鳴らなかった声は、他に声がある限り自動選択の候補からも外す
+        const usableJaVoices = allJaVoices.filter((v) => v.name !== this._voiceFailedName);
+        const jaVoices = usableJaVoices.length ? usableJaVoices : allJaVoices;
         // Prefer a voice the machine renders itself. "Google 日本語" sounds better but
         // is synthesised on Google's servers, so on a machine whose Chrome can't reach
         // them it produces silence with no error and no events at all — indistinguishable
@@ -1414,10 +1583,15 @@ class MessengerClient {
         const localJaVoices = jaVoices.filter((v) => v.localService);
         const pool = localJaVoices.length ? localJaVoices : jaVoices;
         const priorityNames = ['Haruka', 'Nanami', 'Ayumi', 'Google 日本語'];
-        let preferred = null;
+        // 設定で選んだ声があればそれを優先（ネット経由の声でも可。無音なら下の watchdog が拾う）
+        let preferred = this.selectedVoiceName && this.selectedVoiceName !== this._voiceFailedName
+            ? (jaVoices.find((v) => v.name === this.selectedVoiceName) || null)
+            : null;
+        // この発話で実際に試す「選んだ声」の名前（待っている間に選び直されても取り違えない）
+        const attemptedSelectedVoice = preferred ? preferred.name : null;
         for (const name of priorityNames) {
-            preferred = pool.find((v) => v.name.includes(name));
             if (preferred) break;
+            preferred = pool.find((v) => v.name.includes(name));
         }
         if (!preferred) preferred = pool[0];
         if (preferred) utterance.voice = preferred;
@@ -1425,12 +1599,17 @@ class MessengerClient {
         this.debugLog('[VoiceDiag] speaking utterance, jaVoiceCount=%s chosenVoice=%s speaking=%s pending=%s paused=%s', jaVoices.length, preferred && preferred.name, window.speechSynthesis.speaking, window.speechSynthesis.pending, window.speechSynthesis.paused);
 
         let settled = false;
+        let started = false;
         const advance = (evt) => {
             // onend/onerror and the watchdog below race each other; whichever lands
             // first owns this utterance's completion.
             if (settled) return;
             settled = true;
             clearTimeout(watchdog);
+            // 選んだ声が鳴り出す前にエラーを返した（取り消しは除く）→ このページでは自動選択に戻す
+            if (evt && evt.type === 'error' && !started && attemptedSelectedVoice && evt.error !== 'canceled' && evt.error !== 'interrupted') {
+                this._voiceFailedName = attemptedSelectedVoice;
+            }
             this.debugLog('[VoiceDiag] utterance %s fired, error=%s generation=%s currentGeneration=%s', evt && evt.type, evt && evt.error, generation, this._ttsGeneration);
             // Check generation BEFORE touching _ttsPlaying: cancel() delivers this
             // utterance's onend/onerror asynchronously, so a stale callback can still
@@ -1444,6 +1623,7 @@ class MessengerClient {
                 this._ttsSpeaking = false;
                 this._updateMicMuted();
                 this._discardEchoedRecognitionAudio();
+                if (started && evt && evt.type === 'end') this._openCarFollowupWindow();
                 this.debugLog('[VoiceDiag] queue drained, resuming mic: isListening=%s recognitionState=%s', this.isListening, this._recognitionState);
                 // The desired state comes from isListening alone — the user's standing
                 // "I want to be listening". Gating on a snapshot taken when this burst
@@ -1472,6 +1652,14 @@ class MessengerClient {
         const START_TIMEOUT_MS = 3000;
         let watchdog = setTimeout(() => {
             console.warn(`[TTS] onstart never fired within ${START_TIMEOUT_MS}ms — speech synthesis appears wedged; dropping queued speech and resuming mic`);
+            if (attemptedSelectedVoice) {
+                // 選んだ声（ネット経由など）が鳴らない。このページを開いている間は自動選択に戻す
+                this._voiceFailedName = attemptedSelectedVoice;
+                if (this.voiceSelect) {
+                    const opt = [...this.voiceSelect.options].find((o) => o.value === this._voiceFailedName);
+                    if (opt && !opt.textContent.includes('鳴らない')) opt.textContent += '（鳴らないため自動に切替中）';
+                }
+            }
             // Nothing is going to come out of this engine right now, so drop the whole
             // queue rather than feeding each remaining item into the same stall (which
             // would hold the mic through one timeout per item).
@@ -1484,6 +1672,7 @@ class MessengerClient {
             // A cancel (or the start timeout above) may have already retired this
             // utterance; don't arm a completion timer for it in that case.
             if (settled || generation !== this._ttsGeneration) return;
+            started = true;
             // Measured from actual start. Only the per-character part scales with
             // rate — dividing the fixed grace too would leave barely a second at the
             // slider's top setting. The divisor is also capped at 2 because engines
